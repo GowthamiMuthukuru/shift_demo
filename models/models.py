@@ -28,7 +28,7 @@ class UploadedFiles(Base):
     uploaded_by = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"))
     uploaded_at = Column(TIMESTAMP, server_default=func.now())
     record_count = Column(Integer, default=0)
-    status = Column(String(20), default="processed")  # processing | processed | failed
+    status = Column(String(20), default="processed")  # processing, processed, failed
 
     uploader = relationship("Users", back_populates="uploaded_files")
     shift_allowances = relationship("ShiftAllowances", back_populates="uploaded_file")

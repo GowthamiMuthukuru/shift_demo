@@ -12,6 +12,6 @@ pytest==8.4.2
 dotenv
 bcrypt==5.0.0
 passlib==1.7.4
-pydantic[email]==2.3.0
+pydantic[email]
 python-jose[cryptography]==3.5.0
 python-multipart==0.0.20
