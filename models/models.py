@@ -1,8 +1,10 @@
 from sqlalchemy import (
-    Column, Integer, String, Text, ForeignKey, TIMESTAMP, Numeric, func
+    Column, Integer, String, Text, TIMESTAMP, Numeric, func, ForeignKey,UniqueConstraint
 )
 from sqlalchemy.orm import relationship
+from datetime import datetime
 from db import Base
+
 
 # USERS TABLE
 class Users(Base):
@@ -29,9 +31,9 @@ class UploadedFiles(Base):
     uploaded_at = Column(TIMESTAMP, server_default=func.now())
     record_count = Column(Integer, default=0)
     status = Column(String(20), default="processed")  # processing, processed, failed
+    payroll_month = Column(String(7), nullable=False)  # MM-YYYY format
 
     uploader = relationship("Users", back_populates="uploaded_files")
-    shift_allowances = relationship("ShiftAllowances", back_populates="uploaded_file")
 
 
 # SHIFT ALLOWANCES TABLE
@@ -39,7 +41,6 @@ class ShiftAllowances(Base):
     __tablename__ = "shift_allowances"
 
     id = Column(Integer, primary_key=True, index=True)
-    file_id = Column(Integer, ForeignKey("uploaded_files.id", ondelete="CASCADE"))
 
     emp_id = Column(String(50))
     emp_name = Column(String(150))
@@ -51,31 +52,37 @@ class ShiftAllowances(Base):
     account_manager = Column(String(100))
     practice_lead = Column(String(100))
     delivery_manager = Column(String(100))
-    duration_month = Column(String(20))
-    payroll_month = Column(String(20))
+
+    month_year = Column(String(7),nullable=False,default=lambda: datetime.now().strftime("%m-%Y"))
+    duration_month = Column(String(7))               # MM-YYYY format
+    payroll_month = Column(String(7))                # MM-YYYY format
 
     shift_a_days = Column(Integer, default=0)
     shift_b_days = Column(Integer, default=0)
     shift_c_days = Column(Integer, default=0)
     prime_days = Column(Integer, default=0)
     total_days = Column(Integer, default=0)
-    billable_days = Column(Integer, default=0)
-    non_billable_days = Column(Integer, default=0)
-    diff = Column(Integer, default=0)
-    final_total_days = Column(Integer, default=0)
 
     billability_status = Column(String(50))
     practice_remarks = Column(Text)
     rmg_comments = Column(Text)
     amar_approval = Column(String(50))
 
-    shift_a_allowance = Column(Numeric(10, 2), default=0)
-    shift_b_allowance = Column(Numeric(10, 2), default=0)
-    shift_c_allowance = Column(Numeric(10, 2), default=0)
-    prime_allowance = Column(Numeric(10, 2), default=0)
-    total_days_allowance = Column(Numeric(10, 2), default=0)
-
     created_at = Column(TIMESTAMP, server_default=func.now())
     updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now())
+    __table_args__ = (
+    UniqueConstraint('duration_month', 'payroll_month', 'emp_id', name='uix_payroll_employee'),
+)
 
-    uploaded_file = relationship("UploadedFiles", back_populates="shift_allowances")
+
+
+# ALLOWANCE TABLE
+class Allowance(Base):
+    __tablename__ = "allowance"
+
+    id = Column(Integer, primary_key=True, index=True)
+    shift = Column(String(50), nullable=False)
+    amount = Column(Numeric(10, 2), nullable=False)
+    payroll_month = Column(String(7), nullable=False)  # MM-YYYY format
+
+    created_at = Column(TIMESTAMP, server_default=func.now())

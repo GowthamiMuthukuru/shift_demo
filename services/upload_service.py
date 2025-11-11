@@ -2,6 +2,7 @@ import os
 import uuid
 import io
 import pandas as pd
+from datetime import datetime
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
 from models.models import UploadedFiles, ShiftAllowances
@@ -45,10 +46,12 @@ async def process_excel_upload(file, db: Session, user, base_url: str):
     if not file.filename.endswith((".xls", ".xlsx")):
         raise HTTPException(status_code=400, detail="Only Excel files are allowed")
 
+    # Pre-create upload entry
     uploaded_file = UploadedFiles(
         filename=file.filename,
         uploaded_by=uploaded_by,
-        status="processing"
+        status="processing",
+        payroll_month="unknown",  # temporary until we parse Excel
     )
     db.add(uploaded_file)
     db.commit()
@@ -58,7 +61,7 @@ async def process_excel_upload(file, db: Session, user, base_url: str):
         contents = await file.read()
         df = pd.read_excel(io.BytesIO(contents))
 
-        # Map Excel columns to DB fields
+        # Map Excel columns to DB field names
         column_mapping = {e.value: e.name for e in ExcelColumnMap}
         df.rename(columns=column_mapping, inplace=True)
 
@@ -70,47 +73,46 @@ async def process_excel_upload(file, db: Session, user, base_url: str):
         # Replace NaN with 0 for numeric columns
         df = df.where(pd.notnull(df), 0)
 
-        # Define column groups
-        int_columns = [
-            "shift_a_days", "shift_b_days", "shift_c_days",
-            "prime_days", "total_days", "billable_days",
-            "non_billable_days", "diff", "final_total_days"
-        ]
+        # Numeric columns from your current schema
+        int_columns = ["shift_a_days", "shift_b_days", "shift_c_days", "prime_days", "total_days"]
+        numeric_columns = int_columns
 
-        decimal_columns = [
-            "shift_a_allowance", "shift_b_allowance", "shift_c_allowance",
-            "prime_allowance", "total_days_allowance"
-        ]
-
-        numeric_columns = int_columns + decimal_columns
-
-        # Validate and clean
+        # Validate numeric values
         clean_df, error_df = validate_excel_data(df, numeric_columns)
 
         inserted_count = 0
         if not clean_df.empty:
+            # Convert numeric columns
             clean_df[int_columns] = (
                 clean_df[int_columns]
                 .apply(pd.to_numeric, errors="coerce")
                 .round(0)
-                .astype("Int64")  # Nullable integer type
-            )
-            clean_df[decimal_columns] = (
-                clean_df[decimal_columns]
-                .apply(pd.to_numeric, errors="coerce")
-                .round(2)
+                .astype("Int64")
             )
 
-            # Insert valid records
-            shift_records = [
-                ShiftAllowances(file_id=uploaded_file.id, **row)
-                for row in clean_df[required_columns].to_dict(orient="records")
-            ]
+            # Extract payroll month from Excel
+            payroll_month_val = clean_df["payroll_month"].iloc[0]
+            payroll_str = (
+                payroll_month_val if isinstance(payroll_month_val, str)
+                else datetime.strftime(payroll_month_val, "%m-%Y")
+            )
+            uploaded_file.payroll_month = payroll_str
+
+            # Prepare rows for insertion
+            records = clean_df[required_columns].to_dict(orient="records")
+
+            # Add auto month_year (model also sets default, this is explicit)
+            for row in records:
+                if not row.get("month_year"):
+                    row["month_year"] = datetime.now().strftime("%m-%Y")
+
+            shift_records = [ShiftAllowances(**row) for row in records]
+
             db.bulk_save_objects(shift_records)
             db.commit()
             inserted_count = len(shift_records)
 
-        # Generate error Excel if invalid rows exist
+        # Handle errors if invalid rows
         if error_df is not None and not error_df.empty:
             error_filename = f"error_{uuid.uuid4().hex}.xlsx"
             error_path = os.path.join(TEMP_FOLDER, error_filename)
@@ -127,7 +129,7 @@ async def process_excel_upload(file, db: Session, user, base_url: str):
                 "records_inserted": inserted_count,
                 "records_skipped": len(error_df),
                 "download_link": error_download_link,
-                "file_name": error_filename
+                "file_name": error_filename,
             }
 
         # All rows valid
@@ -138,7 +140,7 @@ async def process_excel_upload(file, db: Session, user, base_url: str):
         return {
             "message": "File processed successfully",
             "file_id": uploaded_file.id,
-            "records": inserted_count
+            "records": inserted_count,
         }
 
     except HTTPException:
