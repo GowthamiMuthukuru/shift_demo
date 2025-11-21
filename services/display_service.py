@@ -1,6 +1,6 @@
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
-from models.models import ShiftAllowances, Allowance
+from models.models import ShiftAllowances, ShiftsAmount
 
 def partial_update_shift(db: Session, record_id: int, updates: dict):
     allowed_fields = ["shift_a_days", "shift_b_days", "shift_c_days", "prime_days"]
@@ -28,7 +28,7 @@ def partial_update_shift(db: Session, record_id: int, updates: dict):
     prime = record.prime_days or 0
     record.total_days = shift_a + shift_b + shift_c + prime
  
-    db_rates = {a.shift: float(a.amount) for a in db.query(Allowance).all()}
+    db_rates = {a.shift: float(a.amount) for a in db.query(ShiftsAmount).all()}
     rates = {
         "shift_a_days": 500,
         "shift_b_days": 350,

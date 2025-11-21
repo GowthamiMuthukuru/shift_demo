@@ -6,7 +6,7 @@ import re
 from datetime import datetime
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
-from models.models import UploadedFiles, ShiftAllowances
+from models.models import UploadedFiles, ShiftAllowances, ShiftMapping
 from utils.enums import ExcelColumnMap
 
 TEMP_FOLDER = "media/error_excels"
@@ -17,6 +17,7 @@ MONTH_MAP = {
     'May': 5, 'Jun': 6, 'Jul': 7, 'Aug': 8,
     'Sep': 9, 'Oct': 10, 'Nov': 11, 'Dec': 12
 }
+
 
 def parse_month_format(value: str):
     if not isinstance(value, str):
@@ -32,7 +33,7 @@ def parse_month_format(value: str):
     return None
 
 
-def validate_excel_data(df: pd.DataFrame, numeric_columns: list):
+def validate_excel_data(df: pd.DataFrame):
     errors = []
     error_rows = []
 
@@ -41,24 +42,22 @@ def validate_excel_data(df: pd.DataFrame, numeric_columns: list):
     for idx, row in df.iterrows():
         row_errors = []
 
-        # Numeric columns validation
-        for col in numeric_columns:
+        # Validate shift days
+        for col in ["shift_a_days", "shift_b_days", "shift_c_days", "prime_days"]:
             value = row[col]
-            if not pd.api.types.is_numeric_dtype(type(value)):
-                try:
-                    df.at[idx, col] = pd.to_numeric(value)
-                except (ValueError, TypeError):
-                    row_errors.append(f"Invalid value in '{col}' → '{value}' (expected numeric)")
+            try:
+                df.at[idx, col] = pd.to_numeric(value)
+            except Exception:
+                row_errors.append(f"Invalid value in '{col}' → '{value}'")
 
-        # Month columns validation
+        # Validate month format
         for month_col in ["duration_month", "payroll_month"]:
             value = str(row.get(month_col, "")).strip()
             if value and not month_pattern.match(value):
                 row_errors.append(
-                    f"Invalid month format in '{month_col}' → '{value}' (expected format like Feb'25)"
+                    f"Invalid month format in '{month_col}' → '{value}' (expected like Feb'25)"
                 )
 
-        # Collect invalid rows
         if row_errors:
             row_data = row.to_dict()
             row_data["error"] = "; ".join(row_errors)
@@ -91,63 +90,94 @@ async def process_excel_upload(file, db: Session, user, base_url: str):
         contents = await file.read()
         df = pd.read_excel(io.BytesIO(contents))
 
-        # Rename Excel columns using Enum
+        # Rename columns using Enum
         column_mapping = {e.value: e.name for e in ExcelColumnMap}
         df.rename(columns=column_mapping, inplace=True)
 
-        required_columns = [e.name for e in ExcelColumnMap]
-        missing = [c for c in required_columns if c not in df.columns]
+        # Required columns from Enum
+        required_cols = [e.name for e in ExcelColumnMap]
+        missing = [c for c in required_cols if c not in df.columns]
         if missing:
-            raise HTTPException(status_code=400, detail=f"Missing columns in Excel: {missing}")
+            raise HTTPException(status_code=400, detail=f"Missing columns: {missing}")
 
+        # Replace NaN
         df = df.where(pd.notnull(df), 0)
 
-        int_columns = ["shift_a_days", "shift_b_days", "shift_c_days", "prime_days", "total_days"]
-        numeric_columns = int_columns
+        clean_df, error_df = validate_excel_data(df)
 
-        clean_df, error_df = validate_excel_data(df, numeric_columns)
+        if clean_df.empty:
+            raise HTTPException(status_code=400, detail="No valid rows found in file")
+
+        # Parse months
+        for col in ["duration_month", "payroll_month"]:
+            clean_df[col] = clean_df[col].apply(parse_month_format)
+
+        uploaded_file.payroll_month = clean_df["payroll_month"].iloc[0]
+        db.commit()
 
         inserted_count = 0
-        if not clean_df.empty:
-            clean_df[int_columns] = (
-                clean_df[int_columns]
-                .apply(pd.to_numeric, errors="coerce")
-                .round(0)
-                .astype("Int64")
-            )
 
-            for col in ["duration_month", "payroll_month"]:
-                clean_df[col] = clean_df[col].apply(parse_month_format)
+        # Allowed fields for ShiftAllowances (derived from Enum)
+        shift_fields = {"shift_a_days", "shift_b_days", "shift_c_days", "prime_days"}
+        allowed_fields = {
+            "emp_id", "emp_name", "grade", "department",
+            "client", "project", "project_code",
+            "account_manager", "practice_lead", "delivery_manager",
+            "duration_month", "payroll_month",
+            "billability_status", "practice_remarks", "rmg_comments",
+            "month_year",
+        }
 
-            payroll_date = clean_df["payroll_month"].iloc[0]
-            uploaded_file.payroll_month = payroll_date if payroll_date else None
+        for row in clean_df.to_dict(orient="records"):
 
-            records = clean_df[required_columns].to_dict(orient="records")
+            # Separate shift fields
+            shift_data = {k: int(row.get(k, 0)) for k in shift_fields}
 
-            for row in records:
-                if not row.get("month_year"):
-                    row["month_year"] = datetime.now().date()
+            # Build ShiftAllowances row with only allowed fields
+            sa_payload = {
+                k: row[k] for k in allowed_fields if k in row
+            }
 
-            shift_records = [ShiftAllowances(**row) for row in records]
-            db.bulk_save_objects(shift_records)
-            db.commit()
-            inserted_count = len(shift_records)
 
+            sa = ShiftAllowances(**sa_payload)
+            db.add(sa)
+            db.flush()
+
+            # Insert shift mappings
+            mapping_pairs = [
+                ("A", shift_data["shift_a_days"]),
+                ("B", shift_data["shift_b_days"]),
+                ("C", shift_data["shift_c_days"]),
+                ("PRIME", shift_data["prime_days"]),
+            ]
+
+            for shift_type, days in mapping_pairs:
+                if days > 0:
+                    db.add(ShiftMapping(
+                        shiftallowance_id=sa.id,
+                        shift_type=shift_type,
+                        days=days
+                    ))
+
+            inserted_count += 1
+
+        db.commit()
+
+        # Handle error rows
         if error_df is not None and not error_df.empty:
-            error_filename = f"error_{uuid.uuid4().hex}.xlsx"
-            error_path = os.path.join(TEMP_FOLDER, error_filename)
-            error_df.to_excel(error_path, index=False)
+            error_file = f"error_{uuid.uuid4().hex}.xlsx"
+            path = os.path.join(TEMP_FOLDER, error_file)
+            error_df.to_excel(path, index=False)
 
             uploaded_file.status = "partially_processed"
             uploaded_file.record_count = inserted_count
             db.commit()
 
             return {
-                "message": "File partially processed. Some rows contained invalid data.",
+                "message": "File partially processed",
                 "records_inserted": inserted_count,
                 "records_skipped": len(error_df),
-                "download_link": f"{base_url}/upload/error-files/{error_filename}",
-                "file_name": error_filename,
+                "download_link": f"{base_url}/upload/error-files/{error_file}",
             }
 
         uploaded_file.status = "processed"
@@ -156,7 +186,6 @@ async def process_excel_upload(file, db: Session, user, base_url: str):
 
         return {
             "message": "File processed successfully",
-            "file_id": uploaded_file.id,
             "records": inserted_count,
         }
 
@@ -165,14 +194,9 @@ async def process_excel_upload(file, db: Session, user, base_url: str):
         uploaded_file.status = "failed"
         db.commit()
         raise
+
     except Exception as error:
         db.rollback()
         uploaded_file.status = "failed"
         db.commit()
-        if "duplicate key value violates unique constraint" in str(error):
-            raise HTTPException(
-                status_code=400,
-                detail="Duplicate data found: This record already exists for the same employee and payroll month."
-            )
-    
-        raise HTTPException(status_code=500, detail=f"Processing failed: {str(error)}")
+        raise HTTPException(status_code=500, detail=f"Processing failed: {error}")

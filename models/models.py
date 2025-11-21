@@ -42,7 +42,7 @@ class ShiftAllowances(Base):
 
     id = Column(Integer, primary_key=True, index=True)
 
-    emp_id = Column(String(50))
+    emp_id = Column(String(50), nullable=False)
     emp_name = Column(String(150))
     grade = Column(String(20))
     department = Column(String(100))
@@ -53,36 +53,41 @@ class ShiftAllowances(Base):
     practice_lead = Column(String(100))
     delivery_manager = Column(String(100))
 
-    month_year = Column(Date, nullable=False, default=lambda: datetime.now().date())
     duration_month = Column(Date, nullable=True)
-    payroll_month = Column(Date, nullable=True)                
-
-    shift_a_days = Column(Integer, default=0)
-    shift_b_days = Column(Integer, default=0)
-    shift_c_days = Column(Integer, default=0)
-    prime_days = Column(Integer, default=0)
-    total_days = Column(Integer, default=0)
+    payroll_month = Column(Date, nullable=True)
 
     billability_status = Column(String(50))
     practice_remarks = Column(Text)
     rmg_comments = Column(Text)
-    amar_approval = Column(String(50))
 
     created_at = Column(TIMESTAMP, server_default=func.now())
     updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now())
+
+    shift_mappings = relationship("ShiftMapping", back_populates="shift_allowance")
+
     __table_args__ = (
-    UniqueConstraint('duration_month', 'payroll_month', 'emp_id', name='uix_payroll_employee'),
-)
+        UniqueConstraint('duration_month', 'payroll_month', 'emp_id', name='uix_payroll_employee'),
+    )
 
 
-
-# ALLOWANCE TABLE
-class Allowance(Base):
-    __tablename__ = "allowance"
+class ShiftsAmount(Base):
+    __tablename__ = "shifts_amount"
 
     id = Column(Integer, primary_key=True, index=True)
-    shift = Column(String(50), nullable=False)
+    shift_type = Column(String(50), nullable=False)
     amount = Column(Numeric(10, 2), nullable=False)
-    payroll_month = Column(String(7), nullable=False)  
+    payroll_year = Column(String(7), nullable=False)  # MM-YYYY
 
     created_at = Column(TIMESTAMP, server_default=func.now())
+
+
+# SHIFT MAPPING TABLE
+class ShiftMapping(Base):
+    __tablename__ = "shift_mapping"
+
+    id = Column(Integer, primary_key=True, index=True)
+    shiftallowance_id = Column(Integer, ForeignKey("shift_allowances.id", ondelete="CASCADE"))
+    shift_type = Column(String(50), nullable=False)
+    days = Column(Integer, default=0)
+
+    shift_allowance = relationship("ShiftAllowances", back_populates="shift_mappings")
