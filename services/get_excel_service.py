@@ -2,7 +2,7 @@ import pandas as pd
 import os
 from datetime import datetime
 from sqlalchemy.orm import Session
-from models.models import ShiftAllowances
+from models.models import ShiftAllowances, ShiftMapping
  
  
 def convert_to_db_date_format(payroll_month: str) -> str:
@@ -23,55 +23,56 @@ def export_excel_by_payroll_month(db: Session, payroll_month: str):
     Returns file path if found, else None.
     """
  
-    # Convert MM-YYYY to YYYY-MM-01
     db_date = convert_to_db_date_format(payroll_month)
  
-    # Fetch records
-    data = db.query(ShiftAllowances).filter(
+    # Fetch main shift records
+    shift_records = db.query(ShiftAllowances).filter(
         ShiftAllowances.payroll_month == db_date
     ).all()
  
-    if not data:
+    if not shift_records:
         return None
  
-    # Convert to DataFrame with all fields
-    df = pd.DataFrame([
-        {
-            "emp_id": d.emp_id,
-            "emp_name": d.emp_name,
-            "grade": d.grade,
-            "department": d.department,
-            "client": d.client,
-            "project": d.project,
-            "project_code": d.project_code,
-            "account_manager": d.account_manager,
-            "practice_lead": d.practice_lead,
-            "delivery_manager": d.delivery_manager,
-            "duration_month": d.duration_month,
-            "payroll_month": payroll_month,  # keep original format
-            "shift_a_days": d.shift_a_days,
-            "shift_b_days": d.shift_b_days,
-            "shift_c_days": d.shift_c_days,
-            "prime_days": d.prime_days,
-            "total_days": d.total_days,
-            "billability_status": d.billability_status,
-            "practice_remarks": d.practice_remarks,
-            "rmg_comments": d.rmg_comments,
-            "amar_approval": d.amar_approval,
-        }
-        for d in data
-    ])
+    # Prepare Excel data
+    excel_data = []
  
+    for record in shift_records:
+        # Fetch all shift types for this record
+        shift_types = db.query(ShiftMapping.shift_type).filter(
+            ShiftMapping.shiftallowance_id == record.id
+        ).all()
+ 
+        # Convert to a list of values
+        shift_type_list = [s[0] for s in shift_types] if shift_types else []
+ 
+        excel_data.append({
+            "emp_id": record.emp_id,
+            "emp_name": record.emp_name,
+            "grade": record.grade,
+            "department": record.department,
+            "client": record.client,
+            "project": record.project,
+            "project_code": record.project_code,
+            "account_manager": record.account_manager,
+            "practice_lead": record.practice_lead,
+            "delivery_manager": record.delivery_manager,
+            "duration_month": record.duration_month,
+            "payroll_month": payroll_month,
+            "shift_types": ", ".join(shift_type_list), 
+            "billability_status": record.billability_status,
+            "practice_remarks": record.practice_remarks,
+            "rmg_comments": record.rmg_comments
+        })
+ 
+    df = pd.DataFrame(excel_data)
     df = df.fillna("")
  
-    # Export folder
+    # Folder
     os.makedirs("exports", exist_ok=True)
  
     filename = f"Shift_Allowances_{payroll_month}.xlsx"
     filepath = os.path.join("exports", filename)
  
-    # Write Excel
     df.to_excel(filepath, index=False)
  
     return filepath
-   

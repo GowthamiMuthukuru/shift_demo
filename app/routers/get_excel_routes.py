@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy.orm import Session
 from fastapi.responses import FileResponse
+from sqlalchemy.orm import Session
 from db import get_db
 from utils.dependencies import get_current_user
 from services.get_excel_service import export_excel_by_payroll_month
@@ -14,7 +14,7 @@ def get_excel_data(
     current_user=Depends(get_current_user)
 ):
     """
-    Export employee data for given payroll month.
+    Export employee data for a given payroll month.
     Example: /excel/get_excel_data?payroll_month=03-2025
     """
  
@@ -31,9 +31,6 @@ def get_excel_data(
  
     return FileResponse(
         file_path,
-        media_type=(
-            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        ),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         filename=file_path.split("/")[-1]
     )
- 
