@@ -11,6 +11,8 @@ def parse_shift_value(value: str):
         raise HTTPException(status_code=400, detail=f"Invalid shift value '{value}'. Only numbers allowed.")
     if num < 0:
         raise HTTPException(status_code=400, detail=f"Negative values not allowed: '{value}'.")
+    if num > 22:
+        raise HTTPException(status_code=400, detail=f"can't add more than 22 days.")
     return num
 
 
@@ -28,7 +30,7 @@ def update_shift_service(db: Session, record_id: int, updates: dict):
 
     # Rename to DB shift types + ignore zero updates
     shift_map = {"shift_a": "A", "shift_b": "B", "shift_c": "C", "prime": "PRIME"}
-    mapped_updates = {shift_map[k]: numeric_updates[k] for k in numeric_updates if numeric_updates[k] > 0}
+    mapped_updates = {shift_map[k]: numeric_updates[k] for k in numeric_updates if numeric_updates[k] >= 0}
 
     if not mapped_updates:
         raise HTTPException(status_code=400, detail="No valid shift values provided.")
@@ -42,36 +44,51 @@ def update_shift_service(db: Session, record_id: int, updates: dict):
     rate_rows = db.query(ShiftsAmount).all()
     rates = {r.shift_type.upper(): float(r.amount) for r in rate_rows}
 
-    # Ensure every required rate exists
     for stype in mapped_updates:
         if stype not in rates:
             raise HTTPException(status_code=400, detail=f"Missing rate for shift '{stype}'.")
 
-    # Save updated mapping
     existing = {m.shift_type: m for m in record.shift_mappings}
 
+    # Apply changes temporarily to calculate validation
     for stype, days in mapped_updates.items():
         if stype in existing:
             existing[stype].days = days
         else:
-            db.add(ShiftMapping(
+            temp = ShiftMapping(
                 shiftallowance_id=record.id,
                 shift_type=stype,
                 days=days
-            ))
+            )
+            existing[stype] = temp
+
+    # VALIDATE TOTAL DAYS (must NOT exceed 22)
+    total_days_temp = float(sum(float(m.days) for m in existing.values()))
+    if total_days_temp > 22:
+        db.rollback()
+        raise HTTPException(
+            status_code=400,
+            detail=f"Total days cannot exceed 22 in a month. Current total = {total_days_temp}"
+        )
+
+    # Since validation passed → commit real update this time
+    for stype, days in mapped_updates.items():
+        if stype in record.shift_mappings:
+            continue  # already updated in memory above
+        db.add(existing[stype])
 
     db.commit()
     db.refresh(record)
 
-    # Format response
+    # Prepare response
     shift_details = [
         {"shift": m.shift_type, "days": float(m.days)}
         for m in record.shift_mappings
         if m.shift_type in mapped_updates
     ]
 
-    total_days = float(sum(float(m.days) for m in record.shift_mappings if m.shift_type in mapped_updates))
-    total_allowance = float(sum(float(m.days) * rates[m.shift_type] for m in record.shift_mappings if m.shift_type in mapped_updates))
+    total_days = float(sum(float(m.days) for m in record.shift_mappings))
+    total_allowance = float(sum(float(m.days) * rates[m.shift_type] for m in record.shift_mappings))
 
     return {
         "updated_fields": list(mapped_updates.keys()),
@@ -79,6 +96,7 @@ def update_shift_service(db: Session, record_id: int, updates: dict):
         "total_allowance": total_allowance,
         "shift_details": shift_details
     }
+
 def display_emp_details(emp_id: str, db: Session):
     data = (
         db.query(ShiftAllowances)
