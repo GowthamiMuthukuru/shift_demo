@@ -3,6 +3,7 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 import io
 from db import get_db
+from utils.dependencies import get_current_user
 from services.get_excel_service import export_filtered_excel
 
 router = APIRouter(prefix="/excel")
@@ -12,14 +13,9 @@ router = APIRouter(prefix="/excel")
 def download_excel(
     emp_id: str | None = Query(None),
     account_manager: str | None = Query(None),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user = Depends(get_current_user),
 ):
-    """
-    Download Excel file based on filters.
-    - If both filters empty -> download FULL file
-    - If filtered result empty -> download FULL file
-    - Otherwise -> download FILTERED file
-    """
 
     df = export_filtered_excel(db, emp_id, account_manager)
 
