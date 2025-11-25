@@ -74,7 +74,6 @@ class PaginatedShiftResponse(BaseModel):
     class Config:
         from_attributes = True
 
-# Request Model - what user sends to update shifts
 class ShiftUpdateRequest(BaseModel):
     shift_a: int = 0
     shift_b: int = 0
@@ -82,13 +81,11 @@ class ShiftUpdateRequest(BaseModel):
     prime: int = 0
 
 
-# For showing shift details in response
 class ShiftDetail(BaseModel):
     shift: str
     days: int
 
 
-# Final response after update
 class ShiftUpdateResponse(BaseModel):
     message: str
     updated_fields: List[str]
