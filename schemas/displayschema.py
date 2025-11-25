@@ -19,10 +19,10 @@ class ShiftAllowancesResponse(BaseModel):
 class ClientSummary(BaseModel):
     client: str
     total_employees: int
-    shift_a_days: int
-    shift_b_days: int
-    shift_c_days: int
-    prime_days: int
+    shift_a_days: float
+    shift_b_days: float
+    shift_c_days: float
+    prime_days: float
     total_allowances: float  
 
     class Config:

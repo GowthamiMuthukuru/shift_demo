@@ -1,7 +1,7 @@
 from sqlalchemy.orm import Session
 from models.models import ShiftAllowances, ShiftMapping, ShiftsAmount
-
 from sqlalchemy import extract
+from decimal import Decimal
 
 
 def get_client_shift_summary(db: Session, payroll_month: str):
@@ -9,7 +9,6 @@ def get_client_shift_summary(db: Session, payroll_month: str):
 
     year, month = payroll_month.split("-")
 
-    # Fetch all records for this payroll month
     records = (
         db.query(ShiftAllowances)
         .filter(
@@ -30,31 +29,30 @@ def get_client_shift_summary(db: Session, payroll_month: str):
         if client not in summary:
             summary[client] = {
                 "employees": set(),
-                "shift_a": 0,
-                "shift_b": 0,
-                "shift_c": 0,
-                "prime": 0,
-                "total_allowances": 0
+                "shift_a": Decimal(0),
+                "shift_b": Decimal(0),
+                "shift_c": Decimal(0),
+                "prime": Decimal(0),
+                "total_allowances": Decimal(0)
             }
 
         summary[client]["employees"].add(row.emp_id)
 
-        # Loop shift mapping rows and calculate amounts
         for mapping in row.shift_mappings:
-            shift_type = mapping.shift_type
-            days = mapping.days or 0
+            shift_type = mapping.shift_type.strip().upper()
+            days = Decimal(mapping.days or 0)
 
-            # Add days to summary
-            if shift_type.lower() == "a":
+            # add days
+            if shift_type == "A":
                 summary[client]["shift_a"] += days
-            elif shift_type.lower() == "b":
+            elif shift_type == "B":
                 summary[client]["shift_b"] += days
-            elif shift_type.lower() == "c":
+            elif shift_type == "C":
                 summary[client]["shift_c"] += days
-            elif shift_type.lower() == "prime":
+            elif shift_type == "PRIME":
                 summary[client]["prime"] += days
 
-            # Fetch rate dynamically
+            # fetch rate for year
             rate = (
                 db.query(ShiftsAmount.amount)
                 .filter(ShiftsAmount.shift_type == shift_type)
@@ -62,18 +60,18 @@ def get_client_shift_summary(db: Session, payroll_month: str):
                 .scalar()
             ) or 0
 
-            summary[client]["total_allowances"] += days * float(rate)
+            rate = Decimal(str(rate))
+            summary[client]["total_allowances"] += days * rate
 
-    # Convert final result format
     result = [
         {
             "client": client,
             "total_employees": len(info["employees"]),
-            "shift_a_days": info["shift_a"],
-            "shift_b_days": info["shift_b"],
-            "shift_c_days": info["shift_c"],
-            "prime_days": info["prime"],
-            "total_allowances": round(info["total_allowances"], 2)
+            "shift_a_days": float(info["shift_a"]),
+            "shift_b_days": float(info["shift_b"]),
+            "shift_c_days": float(info["shift_c"]),
+            "prime_days": float(info["prime"]),
+            "total_allowances": float(info["total_allowances"])
         }
         for client, info in summary.items()
     ]

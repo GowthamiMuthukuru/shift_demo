@@ -2,6 +2,7 @@ from datetime import datetime
 from dateutil.relativedelta import relativedelta
 from sqlalchemy.orm import Session
 from models.models import ShiftAllowances, ShiftsAmount
+from decimal import Decimal
 
 
 def get_interval_summary_service(start_month: str, end_month: str, db: Session):
@@ -27,24 +28,46 @@ def get_interval_summary_service(start_month: str, end_month: str, db: Session):
                 client = allowance.client or "Unknown Client"
 
                 if client not in summary:
-                    summary[client] = {"A": 0, "B": 0, "C": 0, "PRIME": 0, "total_amount": 0}
+                    summary[client] = {
+                        "A": Decimal(0),
+                        "B": Decimal(0),
+                        "C": Decimal(0),
+                        "PRIME": Decimal(0),
+                        "total_amount": Decimal(0)
+                    }
 
                 for mapping in allowance.shift_mappings:
                     stype = mapping.shift_type.strip().upper()
+                    days = Decimal(mapping.days or 0)
                     if stype in summary[client]:
-                        summary[client][stype] += mapping.days
+                        summary[client][stype] += days
 
                 payroll_year = str(current.year)
                 shift_amount_rows = db.query(ShiftsAmount).filter(
                     ShiftsAmount.payroll_year == payroll_year
                 ).all()
 
-                amount_map = {sa.shift_type.strip().upper(): float(sa.amount) for sa in shift_amount_rows}
+                amount_map = {
+                    sa.shift_type.strip().upper(): Decimal(str(sa.amount))
+                    for sa in shift_amount_rows
+                }
 
-                for stype, days in summary[client].items():
-                    if stype != "total_amount" and stype in amount_map:
+                for stype in ("A", "B", "C", "PRIME"):
+                    if stype in amount_map:
                         summary[client]["total_amount"] += summary[client][stype] * amount_map[stype]
 
         current += relativedelta(months=1)
 
-    return summary
+    # Convert Decimal to float for final response
+    result = {
+        client: {
+            "A": float(info["A"]),
+            "B": float(info["B"]),
+            "C": float(info["C"]),
+            "PRIME": float(info["PRIME"]),
+            "total_amount": float(info["total_amount"])
+        }
+        for client, info in summary.items()
+    }
+
+    return result
