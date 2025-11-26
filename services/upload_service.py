@@ -172,12 +172,15 @@ async def process_excel_upload(file, db: Session, user, base_url: str):
             uploaded_file.record_count = inserted_count
             db.commit()
 
-            return {
+            raise HTTPException(
+            status_code=400,
+            detail={
                 "message": "File partially processed",
                 "records_inserted": inserted_count,
                 "records_skipped": len(error_df),
                 "download_link": f"{base_url}/upload/error-files/{error_file}",
             }
+        )
 
         uploaded_file.status = "processed"
         uploaded_file.record_count = inserted_count
