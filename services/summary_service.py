@@ -1,46 +1,72 @@
 from sqlalchemy.orm import Session
-from models.models import ShiftAllowances, ShiftMapping, ShiftsAmount
 from sqlalchemy import extract
+from datetime import datetime
 from decimal import Decimal
 from fastapi import HTTPException
 import re
  
+from models.models import ShiftAllowances, ShiftsAmount
  
-def get_client_shift_summary(db: Session, payroll_month: str):
-    """Fetch shift summary filtered by payroll_month (YYYY-MM) including total allowances."""
+def get_client_shift_summary(db: Session, duration_month: str | None = None, account_manager: str | None = None):
+   
+    # Validate account_manager
+    if account_manager:
+        if account_manager != account_manager.strip():
+            raise HTTPException(status_code=400, detail="Spaces are not allowed at start/end of account_manager")
+        if not all(x.isalpha() or x.isspace() for x in account_manager):
+            raise HTTPException(status_code=400, detail="Account manager must contain only letters and spaces")
+        manager_exists = db.query(ShiftAllowances).filter(ShiftAllowances.account_manager == account_manager).first()
+        if not manager_exists:
+            raise HTTPException(status_code=404, detail=f"Account manager '{account_manager}' not found")
  
-    if " " in payroll_month:
-        raise HTTPException(
-            status_code=400,
-            detail="Spaces are not allowed in payroll_month. Use format YYYY-MM"
-        )
+    # Determine duration_month
+    if duration_month:
+        if " " in duration_month:
+            raise HTTPException(status_code=400, detail="Spaces are not allowed in duration_month")
+        if not re.match(r"^\d{4}-\d{2}$", duration_month):
+            raise HTTPException(status_code=400, detail="Invalid duration_month format. Use YYYY-MM")
+        year, month = map(int, duration_month.split("-"))
+        month_str = duration_month
+    else:
+        # No duration_month → pick current month or previous in DB
+        current_month = datetime.today().replace(day=1).date()
+        query = db.query(ShiftAllowances.duration_month)
+        if account_manager:
+            query = query.filter(ShiftAllowances.account_manager == account_manager)
+        nearest = query.filter(ShiftAllowances.duration_month <= current_month)\
+                       .order_by(ShiftAllowances.duration_month.desc()).first()
+        if nearest and nearest[0]:
+            year, month = nearest[0].year, nearest[0].month
+            month_str = nearest[0].strftime("%Y-%m")
+        else:
+            raise HTTPException(status_code=404, detail="No records found for current or previous months")
  
-    if not re.match(r"^\d{4}-\d{2}$", payroll_month):
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid payroll_month format. Expected YYYY-MM"
-        )
-    year, month = payroll_month.split("-")
- 
-    records = (
-        db.query(ShiftAllowances)
-        .filter(
-            extract("year", ShiftAllowances.payroll_month) == int(year),
-            extract("month", ShiftAllowances.payroll_month) == int(month)
-        )
-        .all()
+    # Fetch records
+    query = db.query(ShiftAllowances).filter(
+        extract("year", ShiftAllowances.duration_month) == year,
+        extract("month", ShiftAllowances.duration_month) == month
     )
+    if account_manager:
+        query = query.filter(ShiftAllowances.account_manager == account_manager)
  
+    records = query.all()
     if not records:
-        return []
+        raise HTTPException(status_code=404, detail=f"No records found for duration_month '{month_str}'"
+                                                     f"{' for manager '+account_manager if account_manager else ''}")
  
+    # Get shift rates
+    rates = {r.shift_type.upper(): float(r.amount) for r in db.query(ShiftsAmount).all()}
+ 
+    # Group data
     summary = {}
- 
     for row in records:
+        am = row.account_manager or "Unknown"
         client = row.client or "Unknown"
  
-        if client not in summary:
-            summary[client] = {
+        if am not in summary:
+            summary[am] = {}
+        if client not in summary[am]:
+            summary[am][client] = {
                 "employees": set(),
                 "shift_a": Decimal(0),
                 "shift_b": Decimal(0),
@@ -49,52 +75,40 @@ def get_client_shift_summary(db: Session, payroll_month: str):
                 "total_allowances": Decimal(0)
             }
  
-        summary[client]["employees"].add(row.emp_id)
+        summary[am][client]["employees"].add(row.emp_id)
  
         for mapping in row.shift_mappings:
-            shift_type = mapping.shift_type.strip().upper()
+            stype = mapping.shift_type.strip().upper()
             days = Decimal(mapping.days or 0)
  
-            if shift_type == "A":
-                summary[client]["shift_a"] += days
-            elif shift_type == "B":
-                summary[client]["shift_b"] += days
-            elif shift_type == "C":
-                summary[client]["shift_c"] += days
-            elif shift_type == "PRIME":
-                summary[client]["prime"] += days
+            if stype == "A":
+                summary[am][client]["shift_a"] += days
+            elif stype == "B":
+                summary[am][client]["shift_b"] += days
+            elif stype == "C":
+                summary[am][client]["shift_c"] += days
+            elif stype == "PRIME":
+                summary[am][client]["prime"] += days
  
-            rate = (
-                db.query(ShiftsAmount.amount)
-                .filter(ShiftsAmount.shift_type == shift_type)
-                .filter(ShiftsAmount.payroll_year == year)
-                .scalar()
-            ) or 0
+            rate = Decimal(str(rates.get(stype, 0)))
+            summary[am][client]["total_allowances"] += days * rate
  
-            rate = Decimal(str(rate))
-            summary[client]["total_allowances"] += days * rate
+    #  Build response -
+    result = []
+    for am, clients in summary.items():
+        for client, info in clients.items():
+            total_days = float(info["shift_a"] + info["shift_b"] + info["shift_c"] + info["prime"])
+            result.append({
+                "account_manager": am,
+                "client": client,
+                "total_employees": len(info["employees"]),
+                "shift_a_days": float(info["shift_a"]),
+                "shift_b_days": float(info["shift_b"]),
+                "shift_c_days": float(info["shift_c"]),
+                "prime_days": float(info["prime"]),
+                "total_days": total_days,
+                "total_allowances": float(info["total_allowances"]),
+                "duration_month": month_str
+            })
  
-    result = [
-        {
-            "client": client,
-            "total_employees": len(info["employees"]),
-            "shift_a_days": float(info["shift_a"]),
-            "shift_b_days": float(info["shift_b"]),
-            "shift_c_days": float(info["shift_c"]),
-            "prime_days": float(info["prime"]),
-            "total_allowances": float(info["total_allowances"])
-        }
-        for client, info in summary.items()
-    ]
-    grand = {
-        "client": "TOTAL",
-        "total_employees": sum(len(info["employees"]) for info in summary.values()),
-        "shift_a_days": float(sum(info["shift_a"] for info in summary.values())),
-        "shift_b_days": float(sum(info["shift_b"] for info in summary.values())),
-        "shift_c_days": float(sum(info["shift_c"] for info in summary.values())),
-        "prime_days": float(sum(info["prime"] for info in summary.values())),
-        "total_allowances": float(sum(info["total_allowances"] for info in summary.values()))
-    }
-
-    result.append(grand)
-    return result
+    return {month_str: result}
