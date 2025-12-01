@@ -9,35 +9,30 @@ from io import BytesIO
 from fastapi.responses import StreamingResponse
 
 def fetch_shift_data(db: Session, start: int, limit: int):
-    # Determine current month in YYYY-MM
     current_month = datetime.now().strftime("%Y-%m")
- 
-    # Check if current month records exist
+
     has_current_month = (
         db.query(ShiftAllowances)
         .filter(func.to_char(ShiftAllowances.duration_month, "YYYY-MM") == current_month)
         .first()
     )
- 
+
     if has_current_month:
         selected_month = current_month
-        message = None   # because current month exists
- 
+        message = None
     else:
-        # Get latest available month from DB
         latest_month = (
             db.query(func.to_char(ShiftAllowances.duration_month, "YYYY-MM"))
             .order_by(func.to_char(ShiftAllowances.duration_month, "YYYY-MM").desc())
             .first()
         )
- 
+
         if not latest_month:
             raise HTTPException(status_code=404, detail="No shift data is available.")
- 
+
         selected_month = latest_month[0]
         message = f"No data found for current month {current_month}"
- 
-    # Main query (Do NOT group by emp_id — allow duplicates per month)
+
     query = (
         db.query(
             ShiftAllowances.id.label("id"),
@@ -46,21 +41,48 @@ def fetch_shift_data(db: Session, start: int, limit: int):
             ShiftAllowances.department.label("department"),
             func.to_char(ShiftAllowances.payroll_month, "YYYY-MM").label("payroll_month"),
             ShiftAllowances.client.label("client"),
-            ShiftAllowances.project_code.label("project_code"),
             ShiftAllowances.account_manager.label("account_manager"),
             func.to_char(ShiftAllowances.duration_month, "YYYY-MM").label("duration_month")
         )
         .filter(func.to_char(ShiftAllowances.duration_month, "YYYY-MM") == selected_month)
         .group_by(ShiftAllowances.id, ShiftAllowances.emp_id, ShiftAllowances.emp_name,
                   ShiftAllowances.department, ShiftAllowances.payroll_month,
-                  ShiftAllowances.client, ShiftAllowances.project_code,
-                  ShiftAllowances.account_manager, ShiftAllowances.duration_month)
+                  ShiftAllowances.client, ShiftAllowances.account_manager,
+                  ShiftAllowances.duration_month)
     )
- 
+
     total_records = query.count()
-    data = query.order_by(ShiftAllowances.id.asc()).offset(start).limit(limit).all()
- 
-    return selected_month, total_records, data, message
+    rows = query.order_by(ShiftAllowances.id.asc()).offset(start).limit(limit).all()
+    SHIFT_LABELS = {
+    "A": "A(9PM to 6AM)",
+    "B": "B(4PM to 1AM)",
+    "C": "C(6AM to 3PM)",
+    "PRIME": "PRIME(12AM to 9AM)"
+    }
+
+
+    result = []
+    for row in rows:
+        mappings = (
+            db.query(ShiftMapping.shift_type, ShiftMapping.days)
+            .filter(ShiftMapping.shiftallowance_id == row.id)
+            .all()
+        )
+
+        shift_output = {}
+        for m in mappings:
+            days = float(m.days)
+            if days > 0:
+                label = SHIFT_LABELS.get(m.shift_type, m.shift_type)
+                shift_output[label] = days
+
+        result.append({
+            **row._asdict(),
+            **shift_output    # merge directly into main response
+        })
+    return selected_month, total_records, result, message
+
+
 def parse_shift_value(value: str):
     """Convert input to float and validate shift value."""
     if value is None or str(value).strip() == "":

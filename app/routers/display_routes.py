@@ -13,7 +13,7 @@ from fastapi.responses import StreamingResponse
 
 router = APIRouter(prefix="/display")
 
-@router.get("/", response_model=PaginatedShiftResponse)
+@router.get("/")
 def get_all_data(
     start: int = Query(0, ge=0),
     limit: int = Query(10, gt=0),

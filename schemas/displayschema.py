@@ -1,5 +1,5 @@
 from pydantic import BaseModel
-from typing import Optional, List
+from typing import Optional, List,Dict
 from datetime import datetime,date
 
 
@@ -10,14 +10,16 @@ class ShiftAllowancesResponse(BaseModel):
     department: str
     payroll_month: str
     client: str
-    project_code: Optional[str]
     account_manager: str
     duration_month: str
+    shift_types: List
+    shift_days: Dict
  
     class Config:
         from_attributes = True
 
 class ClientSummary(BaseModel):
+    account_manager: str
     client: str
     total_employees: int
     shift_a_days: float
