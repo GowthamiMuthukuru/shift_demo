@@ -1,8 +1,9 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
+ 
 from db import get_db
+from utils.dependencies import get_current_user  
 from services.get_interval_summary_service import get_interval_summary_service
-from utils.dependencies import get_current_user
  
 router = APIRouter()
  
@@ -12,7 +13,7 @@ def interval_summary(
     end_month: str | None = None,
     account_manager: str | None = None,
     db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(get_current_user)  
 ):
     try:
         return get_interval_summary_service(

@@ -71,8 +71,6 @@ def parse_shift_value(value: str):
         raise HTTPException(status_code=400, detail=f"Invalid shift value '{value}'. Only numbers allowed.")
     if num < 0:
         raise HTTPException(status_code=400, detail=f"Negative values not allowed: '{value}'.")
-    if num > 22:
-        raise HTTPException(status_code=400, detail=f"Can't add more than 22 days per shift.")
     return num
  
 def update_shift_service(
@@ -148,10 +146,10 @@ def update_shift_service(
             existing[stype] = temp
  
     # Validate total days
-    total_days_temp = float(sum(float(m.days) for m in existing.values()))
-    if total_days_temp > 22:
-        db.rollback()
-        raise HTTPException(status_code=400, detail=f"Total days cannot exceed 22 in a month. Current total = {total_days_temp}")
+    # total_days_temp = float(sum(float(m.days) for m in existing.values()))
+    # if total_days_temp > 22:
+    #     db.rollback()
+    #     raise HTTPException(status_code=400, detail=f"Total days cannot exceed 22 in a month. Current total = {total_days_temp}")
  
     # Commit updates
     for stype, days in mapped_updates.items():
