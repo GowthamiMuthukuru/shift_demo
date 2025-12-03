@@ -224,6 +224,22 @@ def client_comparison_service(
             "head_count": len(emp_ids_month),
         }
 
+    sorted_months = sorted(data.keys())
+    for idx in range(len(sorted_months)):
+        curr_month_key = sorted_months[idx]
+        curr_total = float(data[curr_month_key]["vertical_total"]["total_allowance"])
+
+        y, m = map(int, curr_month_key.split("-"))
+        prev_y = y if m > 1 else y - 1
+        prev_m = m - 1 if m > 1 else 12
+        prev_month_seq = f"{prev_y:04d}-{prev_m:02d}"
+
+        if prev_month_seq not in data:
+            data[curr_month_key]["vertical_total"]["month_total_diff"] = 0.0
+        else:
+            prev_total = float(data[prev_month_seq]["vertical_total"]["total_allowance"])
+            data[curr_month_key]["vertical_total"]["month_total_diff"] = curr_total - prev_total
+
     horizontal_total: Dict[str, Dict[str, Any]] = {}
 
     for month_key, month_bucket in data.items():
