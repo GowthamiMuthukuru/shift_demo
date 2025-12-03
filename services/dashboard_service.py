@@ -5,6 +5,8 @@ from decimal import Decimal
 from fastapi import HTTPException
 from models.models import ShiftAllowances, ShiftsAmount
 from schemas.dashboardschema import VerticalGraphResponse
+from dateutil.relativedelta import relativedelta
+from sqlalchemy import func
 
 
 def validate_month_format(month: str):
@@ -133,120 +135,305 @@ def get_all_clients_service(db: Session):
     return {"clients": client_list}
 
 
-def get_piechart_shift_summary(db: Session, duration_month: str):
+def get_piechart_shift_summary(
+    db: Session,
+    start_month: str | None,
+    end_month: str | None,
+    top: str | None
+):
+    if top is None:
+        top_int = None                     
+    else:
+        if top.lower() == "all":
+            top_int = None
+        else:
+            if not top.isdigit():
+                raise HTTPException(400, "top must be a positive integer or 'all'")
+            top_int = int(top)
+            if top_int <= 0:
+                raise HTTPException(400, "top must be greater than 0")
 
-    if " " in duration_month:
-        raise HTTPException(status_code=400, detail="Spaces are not allowed in duration_month. Use format YYYY-MM")
+   
+    def validate_month(m: str):
+        try:
+            datetime.strptime(m, "%Y-%m")
+            return True
+        except:
+            return False
 
-    try:
-        year, month = map(int, duration_month.split("-"))
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid duration_month format. Use YYYY-MM")
+    def generate_months(start_m: str, end_m: str):
+        result = []
+        cur = datetime.strptime(start_m, "%Y-%m")
+        end = datetime.strptime(end_m, "%Y-%m")
 
-    records = (
-        db.query(ShiftAllowances)
-        .filter(
-            extract("year", ShiftAllowances.duration_month) == year,
-            extract("month", ShiftAllowances.duration_month) == month
-        )
-        .all()
-    )
+        while cur <= end:
+            result.append(cur.strftime("%Y-%m"))
+            cur += relativedelta(months=1)
 
-    if not records:
-        raise HTTPException(status_code=404, detail=f"No shift data found for duration_month '{duration_month}'")
+        return result
 
-    rate_rows = db.query(ShiftsAmount).filter(ShiftsAmount.payroll_year == str(year)).all()
+    
+   
+    if not start_month and not end_month:
+        check_month = datetime.now().strftime("%Y-%m")
+        months = None
+
+        for _ in range(12):  # go back 12 months
+            exists = (
+                db.query(ShiftAllowances)
+                .filter(func.to_char(ShiftAllowances.duration_month, 'YYYY-MM') == check_month)
+                .first()
+            )
+            if exists:
+                months = [check_month]
+                break
+
+            check_month = (
+                datetime.strptime(check_month, "%Y-%m") - relativedelta(months=1)
+            ).strftime("%Y-%m")
+
+        if not months:
+            return [{"message": "No data found in the last 12 months"}]
+
+    
+    elif start_month and not end_month:
+
+        if not validate_month(start_month):
+            raise HTTPException(400, "start_month must be in YYYY-MM format")
+
+        months = [start_month]
+
+    else:
+        if not validate_month(start_month):
+            raise HTTPException(400, "start_month must be in YYYY-MM format")
+
+        if not validate_month(end_month):
+            raise HTTPException(400, "end_month must be in YYYY-MM format")
+
+        if end_month < start_month:
+            raise HTTPException(400, "end_month cannot be less than start_month")
+
+        months = generate_months(start_month, end_month)
+
+    rate_rows = db.query(ShiftsAmount).all()
     rates = {r.shift_type.upper(): float(r.amount) for r in rate_rows}
 
-    summary = {}
+    final_response = []
 
-    for row in records:
-        client = row.client or "Unknown"
+    for m in months:
+        year, month = map(int, m.split("-"))
 
-        if client not in summary:
-            summary[client] = {
-                "employees": set(),
-                "shift_a": 0,
-                "shift_b": 0,
-                "shift_c": 0,
-                "prime": 0,
-                "total_allowances": 0
-            }
+        records = (
+            db.query(ShiftAllowances)
+            .filter(
+                extract("year", ShiftAllowances.duration_month) == year,
+                extract("month", ShiftAllowances.duration_month) == month
+            )
+            .all()
+        )
 
-        summary[client]["employees"].add(row.emp_id)
+        if not records:
+            final_response.append({
+                "month": m,
+                "message": f"No shift data found for month {m}"
+            })
+            continue
 
-        for mapping in row.shift_mappings:
-            stype = mapping.shift_type.upper()
-            days = int(mapping.days or 0)
+        summary = {}
 
-            if stype == "A":
-                summary[client]["shift_a"] += days
-            elif stype == "B":
-                summary[client]["shift_b"] += days
-            elif stype == "C":
-                summary[client]["shift_c"] += days
-            elif stype == "PRIME":
-                summary[client]["prime"] += days
+        for row in records:
+            client = row.client or "Unknown"
 
-            summary[client]["total_allowances"] += days * rates.get(stype, 0)
+            if client not in summary:
+                summary[client] = {
+                    "employees": set(),
+                    "shift_a": 0,
+                    "shift_b": 0,
+                    "shift_c": 0,
+                    "prime": 0,
+                    "total_allowances": 0
+                }
 
-    result = []
-    for client, info in summary.items():
-        total_days = info["shift_a"] + info["shift_b"] + info["shift_c"] + info["prime"]
-        result.append({
-            "client_name": client,
-            "total_employees": len(info["employees"]),
-            "shift_a": info["shift_a"],
-            "shift_b": info["shift_b"],
-            "shift_c": info["shift_c"],
-            "prime": info["prime"],
-            "total_days": total_days,
-            "total_allowances": info["total_allowances"]
+            summary[client]["employees"].add(row.emp_id)
+
+            for mapping in row.shift_mappings:
+                stype = mapping.shift_type.upper()
+                days = int(mapping.days or 0)
+
+                if stype == "A":
+                    summary[client]["shift_a"] += days
+                elif stype == "B":
+                    summary[client]["shift_b"] += days
+                elif stype == "C":
+                    summary[client]["shift_c"] += days
+                elif stype == "PRIME":
+                    summary[client]["prime"] += days
+
+                summary[client]["total_allowances"] += days * rates.get(stype, 0)
+
+
+        result = []
+        for client, info in summary.items():
+
+            total_days = info["shift_a"] + info["shift_b"] + info["shift_c"] + info["prime"]
+
+            result.append({
+                "client_name": client,
+                "total_employees": len(info["employees"]),
+                "shift_a": info["shift_a"],
+                "shift_b": info["shift_b"],
+                "shift_c": info["shift_c"],
+                "prime": info["prime"],
+                "total_days": total_days,
+                "total_allowances": info["total_allowances"]
+            })
+
+        
+        result = sorted(result, key=lambda x: x["total_allowances"], reverse=True)
+
+
+        if top_int is not None:
+            result = result[:top_int]
+
+        final_response.append({
+            "month": m,
+            "clients": result
         })
 
-    return result
+    return final_response
 
 
-def get_client_total_allowance_service(db: Session, duration_month: str):
 
-    try:
-        month_date = datetime.strptime(duration_month, "%Y-%m")
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid duration_month format. Use YYYY-MM")
 
-    records = (
-        db.query(ShiftAllowances)
-        .filter(
-            extract("year", ShiftAllowances.duration_month) == month_date.year,
-            extract("month", ShiftAllowances.duration_month) == month_date.month
-        )
-        .all()
-    )
+def get_vertical_bar_service(
+    db: Session,
+    start_month: str | None = None,
+    end_month: str | None = None,
+    top: str | None = None
+):
+    
+    if top is None:
+        top_int = None 
+    else:
+        if str(top).lower() == "all":
+            top_int = None
+        else:
+            if not str(top).isdigit():
+                raise HTTPException(
+                    status_code=400,
+                    detail="top must be a positive integer or 'all'"
+                )
+            top_int = int(top)
+            if top_int <= 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail="top must be greater than 0"
+                )
 
-    if not records:
-        raise HTTPException(status_code=404, detail=f"No records found for duration_month '{duration_month}'")
+    def validate_month_format(m: str):
+        try:
+            datetime.strptime(m, "%Y-%m")
+            return True
+        except ValueError:
+            return False
 
-    rate_rows = db.query(ShiftsAmount).filter(ShiftsAmount.payroll_year == str(month_date.year)).all()
+    def generate_months_list(start_m: str, end_m: str):
+        result = []
+        cur = datetime.strptime(start_m, "%Y-%m")
+        end = datetime.strptime(end_m, "%Y-%m")
+        while cur <= end:
+            result.append(cur.strftime("%Y-%m"))
+            cur += relativedelta(months=1)
+        return result
+
+    if not start_month and not end_month:
+        check_month = datetime.now().strftime("%Y-%m")
+        months = None
+        for _ in range(12):
+            exists = (
+                db.query(ShiftAllowances)
+                .filter(func.to_char(ShiftAllowances.duration_month, 'YYYY-MM') == check_month)
+                .first()
+            )
+            if exists:
+                months = [check_month]
+                break
+            check_month = (
+                datetime.strptime(check_month, "%Y-%m") - relativedelta(months=1)
+            ).strftime("%Y-%m")
+        if not months:
+            return [{"message": "No data found for last 12 months"}]
+
+    elif start_month and not end_month:
+        if not validate_month_format(start_month):
+            raise HTTPException(status_code=400, detail="start_month must be in YYYY-MM format")
+        months = [start_month]
+
+    else:
+        if not validate_month_format(start_month):
+            raise HTTPException(status_code=400, detail="start_month must be in YYYY-MM format")
+        if not validate_month_format(end_month):
+            raise HTTPException(status_code=400, detail="end_month must be in YYYY-MM format")
+        if end_month < start_month:
+            raise HTTPException(status_code=400, detail="end_month cannot be less than start_month")
+        months = generate_months_list(start_month, end_month)
+
+    rate_rows = db.query(ShiftsAmount).all()
     rates = {r.shift_type.upper(): float(r.amount) for r in rate_rows}
 
-    client_totals = {}
+    final_response = []
 
-    for rec in records:
-        client = rec.client or "Unknown"
-        if client not in client_totals:
-            client_totals[client] = {"total_days": 0.0, "total_allowances": 0.0}
-
-        for mapping in rec.shift_mappings:
-            stype = mapping.shift_type.upper()
-            days = float(mapping.days or 0)
-            client_totals[client]["total_days"] += days
-            client_totals[client]["total_allowances"] += days * rates.get(stype, 0)
-
-    return [
-        VerticalGraphResponse(
-            client_name=client,
-            total_days=totals["total_days"],
-            total_allowances=totals["total_allowances"]
+    for m in months:
+        year, month_num = map(int, m.split("-"))
+        records = (
+            db.query(ShiftAllowances)
+            .filter(
+                extract("year", ShiftAllowances.duration_month) == year,
+                extract("month", ShiftAllowances.duration_month) == month_num
+            )
+            .all()
         )
-        for client, totals in client_totals.items()
-    ]
+
+        if not records:
+            final_response.append({
+                "month": m,
+                "message": f"No shift data found for month {m}"
+            })
+            continue
+
+        summary = {}
+        for row in records:
+            client = row.client or "Unknown"
+            if client not in summary:
+                summary[client] = {
+                    "total_days": 0,
+                    "total_allowances": 0
+                }
+            for mapping in row.shift_mappings:
+                stype = mapping.shift_type.upper()
+                days = float(mapping.days or 0)
+                summary[client]["total_days"] += days
+                summary[client]["total_allowances"] += days * rates.get(stype, 0)
+
+        # Build sorted result
+        result = [
+            {
+                "client_name": c,
+                "total_days": info["total_days"],
+                "total_allowances": info["total_allowances"]
+            }
+            for c, info in summary.items()
+        ]
+        result = sorted(result, key=lambda x: x["total_allowances"], reverse=True)
+
+        if top_int is not None:
+            result = result[:top_int]
+
+        final_response.append({
+            "month": m,
+            "clients": result
+        })
+
+    return final_response
+
+

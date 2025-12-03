@@ -7,7 +7,7 @@ from services.dashboard_service import (
     get_horizontal_bar_service, 
     get_graph_service,
     get_all_clients_service,
-    get_client_total_allowance_service,
+    get_vertical_bar_service,
     get_piechart_shift_summary
 )
 from typing import List
@@ -42,19 +42,36 @@ def get_clients(
     return get_all_clients_service(db)
 
 
-@router.get("/piechart", response_model=list[PieChartClientShift])
+@router.get("/piechart")
 def piechart(
-    duration_month: str,
+    start_month: str | None = None,
+    end_month: str | None = None,
+    top: str | None = None,
+    db: Session = Depends(get_db),
+    current_user = Depends(get_current_user)
+
+
+):
+    return get_piechart_shift_summary(
+        db=db,
+        start_month=start_month,
+        end_month=end_month,
+        top=top
+    )
+
+
+@router.get("/vertical-bar", response_model=List[dict])
+def vertical_bar(
+    start_month: str | None = None,
+    end_month: str | None = None,
+    top: int | None = None,
     db: Session = Depends(get_db),
     current_user = Depends(get_current_user)
 ):
-    return get_piechart_shift_summary(db, duration_month)
+    return get_vertical_bar_service(
+        db=db,
+        start_month=start_month,
+        end_month=end_month,
+        top=top
+    )
 
-
-@router.get("/vertical-graph", response_model=List[VerticalGraphResponse])
-def vertical_graph(
-    duration_month: str,
-    db: Session = Depends(get_db),
-    current_user = Depends(get_current_user)
-):
-    return get_client_total_allowance_service(db, duration_month)
