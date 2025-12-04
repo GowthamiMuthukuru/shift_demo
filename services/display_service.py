@@ -194,7 +194,7 @@ def update_shift_service(
 
 def fetch_shift_record(emp_id: str, duration_month: str, payroll_month: str, db: Session):
 
-    # convert input month strings to DATE format (YYYY-MM)
+
     try:
         duration_dt = datetime.strptime(duration_month + "-01", "%Y-%m-%d").date()
         payroll_dt = datetime.strptime(payroll_month + "-01", "%Y-%m-%d").date()
@@ -215,7 +215,6 @@ def fetch_shift_record(emp_id: str, duration_month: str, payroll_month: str, db:
     if not record:
         raise HTTPException(status_code=404, detail="Record not found")
 
-    # Base response body
     result = {
         "id": record.id,
         "emp_id": record.emp_id,
@@ -233,16 +232,16 @@ def fetch_shift_record(emp_id: str, duration_month: str, payroll_month: str, db:
         "billability_status": record.billability_status,
         "practice_remarks": record.practice_remarks,
         "rmg_comments": record.rmg_comments,
-        "created_at": record.created_at,
-        "updated_at": record.updated_at,
-        # initialize shifts with default 0
+
+        "created_at": record.created_at.strftime("%Y-%m-%d") if record.created_at else None,
+        "updated_at": record.updated_at.strftime("%Y-%m-%d") if record.updated_at else None,
+
         "A": 0,
         "B": 0,
         "C": 0,
         "PRIME": 0
     }
 
-    # update shifts with values from mappings
     for m in record.shift_mappings:
         stype = m.shift_type.strip().upper()
         if stype in ("A", "B", "C", "PRIME"):
