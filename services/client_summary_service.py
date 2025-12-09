@@ -2,7 +2,7 @@ from datetime import datetime, date
 from calendar import monthrange
 from typing import Optional, Dict, Any
 from collections import defaultdict
-
+from utils.client_enums import Company
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
 from sqlalchemy import func, and_
@@ -34,9 +34,11 @@ def _build_summary(rows: list) -> Dict[str, Any]:
 
         global_emp_set.add(emp_id)
         global_totals[shift_type] += shift_allowance
+        abbr = next((c.name for c in Company if c.value == client_name), None)
+        client_key = abbr if abbr else client_name
 
         client_bucket = clients.setdefault(
-            client_name,
+            client_key,
             {
                 "client_head_set": set(),
                 "client_A": 0.0,

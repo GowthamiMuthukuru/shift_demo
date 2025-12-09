@@ -8,7 +8,7 @@ from schemas.dashboardschema import VerticalGraphResponse,VerticalBarResponse
 from dateutil.relativedelta import relativedelta
 from sqlalchemy import func
 from typing import List
-
+from utils.client_enums import Company
 
 def validate_month_format(month: str):
     try:
@@ -67,7 +67,7 @@ def get_horizontal_bar_service(db: Session, start_month: str | None, end_month: 
     for client, info in output.items():
         total = len(info["total_unique_employees"])
         result.append({
-            "client": client,
+            "client": next((c.name for c in Company if c.value == client), client),
             "total_unique_employees": total,
             "A": float(info["A"]),
             "B": float(info["B"]),
@@ -287,7 +287,9 @@ def get_piechart_shift_summary(
             .all()
         )
         for row in records:
-            client = row.client or "Unknown"
+            client_real = row.client or "Unknown"
+            client = next((c.name for c in Company if c.value == client_real), client_real)
+
             if client not in combined:
                 combined[client] = {
                     "employees": set(),
@@ -321,7 +323,7 @@ def get_piechart_shift_summary(
     for client, info in combined.items():
         total_days = info["shift_a"] + info["shift_b"] + info["shift_c"] + info["prime"]
         result.append({
-            "client_name": client,
+            "client": client,
             "total_employees": len(info["employees"]),
             "shift_a": info["shift_a"],
             "shift_b": info["shift_b"],
@@ -415,10 +417,14 @@ def get_vertical_bar_service(
             extract("year", ShiftAllowances.duration_month) == year,
             extract("month", ShiftAllowances.duration_month) == month_num
         ).all()
+
         for row in records:
-            client = row.client or "Unknown"
+            client_real = row.client or "Unknown"
+            client = next((c.name for c in Company if c.value == client_real), client_real)
+
             if client not in summary:
                 summary[client] = {"total_days": 0, "total_allowances": 0}
+
             for mapping in row.shift_mappings:
                 stype = mapping.shift_type.upper()
                 days = float(mapping.days or 0)
@@ -430,16 +436,15 @@ def get_vertical_bar_service(
 
     result = [
         VerticalGraphResponse(
-            client_name=c,
+            client_name=client, 
             total_days=info["total_days"],
             total_allowances=info["total_allowances"]
         )
-        for c, info in summary.items()
+        for client, info in summary.items()
     ]
 
     result.sort(key=lambda x: x.total_allowances, reverse=True)
 
-   
     if top_int is not None:
         result = result[:top_int]
 

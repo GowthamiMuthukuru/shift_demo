@@ -7,6 +7,7 @@ from typing import Optional
 import pandas as pd
 from io import BytesIO
 from fastapi.responses import StreamingResponse
+from utils.client_enums import Company
 
 def fetch_shift_data(db: Session, start: int, limit: int):
     current_month = datetime.now().strftime("%Y-%m")
@@ -75,9 +76,14 @@ def fetch_shift_data(db: Session, start: int, limit: int):
             if days > 0:
                 label = SHIFT_LABELS.get(m.shift_type, m.shift_type)
                 shift_output[label] = days
+        client_name = row.client
+        abbr = next((c.name for c in Company if c.value == client_name), None)
+        if abbr:
+            client_name = abbr
 
         result.append({
             **row._asdict(),
+            "client": client_name,
             "shift_details": shift_output
         })
     return selected_month, total_records, result, message
@@ -221,7 +227,7 @@ def fetch_shift_record(emp_id: str, duration_month: str, payroll_month: str, db:
         "emp_name": record.emp_name,
         "grade": record.grade,
         "department": record.department,
-        "client": record.client,
+        "client": next((c.name for c in Company if c.value == record.client), record.client),
         "project": record.project,
         "project_code": record.project_code,
         "account_manager": record.account_manager,

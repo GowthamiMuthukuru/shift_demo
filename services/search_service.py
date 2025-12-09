@@ -4,7 +4,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import func
 from fastapi.encoders import jsonable_encoder
 from models.models import ShiftAllowances, ShiftMapping
-
+from utils.client_enums import Company
 SHIFT_LABELS = {
     "A": "A(9PM to 6AM)",
     "B": "B(4PM to 1AM)",
@@ -102,6 +102,10 @@ def export_filtered_excel(
             days = float(m.days)
             if days > 0:
                 shift_output[SHIFT_LABELS.get(m.shift_type, m.shift_type)] = days
+        client_name = row_dict.get("client")
+        abbr = next((c.name for c in Company if c.value == client_name), None)
+        if abbr:
+            row_dict["client"] = abbr
 
         row_dict["shift_details"] = shift_output
         result.append(row_dict)
