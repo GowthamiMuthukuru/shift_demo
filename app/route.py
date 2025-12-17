@@ -2,7 +2,7 @@ from fastapi import APIRouter
 from app.routers import (auth_routes, client_comparision_routes,upload_routes,display_routes,
                          summary_routes,get_excel_routes,search_routes,
                          get_interval_summary_routes,dashboard_routes,
-                         search_month_routes,client_summary_routes,department_summary_routes)
+                         search_month_routes,client_summary_routes,department_summary_routes,client_summary_download_routes)
 
 
 router = APIRouter()
@@ -19,3 +19,4 @@ router.include_router(dashboard_routes.router, tags=["Dashboard"])
 router.include_router(client_comparision_routes.router, tags=["Client Comparision"])
 router.include_router(client_summary_routes.router, tags=["Client Summary"])
 router.include_router(department_summary_routes.router, tags=["Department Summary"])
+router.include_router(client_summary_download_routes.router,tags=["Client summary download"])
