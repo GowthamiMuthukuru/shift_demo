@@ -1,28 +1,30 @@
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
+
 from db import get_db
-from services.search_service import export_filtered_excel as get_employee_details
+from services.search_service import export_filtered_excel
 from utils.dependencies import get_current_user
 
-router = APIRouter(prefix="/employee-details", tags=["Search Details"])
+router = APIRouter(
+    prefix="/employee-details",
+    tags=["Search Details"]
+)
 
-
-@router.get("/Search")
+@router.get("/search")
 def fetch_employee_details(
     emp_id: str | None = Query(None),
     account_manager: str | None = Query(None),
     department: str | None = Query(None),
     client: str | None = Query(None),
-    start_month: str | None = Query(None),
-    end_month: str | None = Query(None),
-
-    start: int | None = Query(None, ge=0),
-    limit: int | None = Query(None, gt=0),
-
+    start_month: str | None = Query(None, description="YYYY-MM"),
+    end_month: str | None = Query(None, description="YYYY-MM"),
+    start: int | None = Query(0, ge=0),
+    limit: int | None = Query(10, gt=0),
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
-    total_records, data = get_employee_details(
+  
+    return export_filtered_excel(
         db=db,
         emp_id=emp_id,
         account_manager=account_manager,
@@ -33,8 +35,3 @@ def fetch_employee_details(
         start=start,
         limit=limit,
     )
-
-    return {
-        "total_records": total_records,
-        "data": data
-    }

@@ -28,7 +28,6 @@ MONTH_MAP = {
     "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12
 }
 
-
 def make_json_safe(obj):
     if isinstance(obj, (datetime, date)):
         return obj.isoformat()
@@ -50,10 +49,8 @@ def parse_month_format(value: str):
 
 
 def load_shift_rates(db: Session) -> dict:
-    
     rates = {}
-    rows = db.query(ShiftsAmount).all()
-    for r in rows:
+    for r in db.query(ShiftsAmount).all():
         if r.shift_type:
             rates[r.shift_type.upper()] = float(r.amount or 0)
     return rates
@@ -78,7 +75,20 @@ def delete_existing_emp_month(db: Session, emp_id, duration_month, payroll_month
 
     db.flush()
 
+def validate_required_excel_columns(df: pd.DataFrame):
+    required_columns = {e.value for e in ExcelColumnMap}
+    uploaded_columns = set(df.columns)
 
+    missing = required_columns - uploaded_columns
+
+    if missing:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": "Invalid Excel format",
+                "missing_columns": sorted(missing)
+            }
+        )
 
 def validate_excel_data(df: pd.DataFrame):
     errors = []
@@ -97,6 +107,8 @@ def validate_excel_data(df: pd.DataFrame):
         ]:
             try:
                 df.at[idx, col] = float(row.get(col, 0))
+                if df.at[idx, col] < 0:
+                    row_errors.append(f"Negative value in '{col}'")
             except Exception:
                 row_errors.append(f"Invalid numeric value in '{col}'")
 
@@ -139,14 +151,14 @@ def normalize_error_rows(error_rows):
 
         for err in err_text.split(";"):
             err = err.strip()
-            if "Invalid numeric value" in err:
+            if "Invalid numeric value" in err or "Negative value" in err:
                 col = err.split("'")[1]
-                reason[col] = "Expected numeric value"
+                reason[col] = "Expected non-negative numeric value"
             elif "Invalid month format" in err:
                 if "duration_month" in err:
-                    reason["duration_month"] = "Expected Jan'24"
+                    reason["duration_month"] = "Expected Jan'25"
                 elif "payroll_month" in err:
-                    reason["payroll_month"] = "Expected Jan'24"
+                    reason["payroll_month"] = "Expected Jan'25"
             elif "Total days do not match" in err:
                 reason["total_days"] = "Shift days mismatch"
 
@@ -154,8 +166,6 @@ def normalize_error_rows(error_rows):
         normalized.append(r)
 
     return normalized
-
-
 
 async def process_excel_upload(file, db: Session, user, base_url: str):
 
@@ -173,6 +183,11 @@ async def process_excel_upload(file, db: Session, user, base_url: str):
 
     try:
         df = pd.read_excel(io.BytesIO(await file.read()))
+
+       
+        validate_required_excel_columns(df)
+
+       
         df.rename(columns={e.value: e.name for e in ExcelColumnMap}, inplace=True)
         df = df.where(pd.notnull(df), 0)
 
@@ -183,7 +198,7 @@ async def process_excel_upload(file, db: Session, user, base_url: str):
 
         if error_df is not None and not error_df.empty:
             error_rows = normalize_error_rows(error_df.to_dict(orient="records"))
-            fname = f"mixed_validation_errors_{uuid.uuid4().hex}.xlsx"
+            fname = f"validation_errors_{uuid.uuid4().hex}.xlsx"
             error_df.to_excel(os.path.join(TEMP_FOLDER, fname), index=False)
 
         if clean_df.empty:
@@ -210,7 +225,6 @@ async def process_excel_upload(file, db: Session, user, base_url: str):
             "account_manager", "practice_lead", "delivery_manager",
             "duration_month", "payroll_month",
             "billability_status", "practice_remarks", "rmg_comments",
-            "month_year",
         }
 
         for row in clean_df.to_dict(orient="records"):
@@ -271,7 +285,6 @@ async def process_excel_upload(file, db: Session, user, base_url: str):
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
-
 
 def parse_yyyy_mm(value: str) -> date:
     """
