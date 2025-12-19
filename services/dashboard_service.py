@@ -521,7 +521,7 @@ SHIFT_TYPES = ["A", "B", "C", "PRIME"]
 
 def get_client_dashboard_summary(db: Session, payload: DashboardFilterRequest):
 
-    if payload.start_month and payload.year:
+    if payload.start_month and payload.selected_year:
         raise HTTPException(
             status_code=400,
             detail="Use either month range OR year-based filters, not both"
@@ -533,22 +533,33 @@ def get_client_dashboard_summary(db: Session, payload: DashboardFilterRequest):
         start = date.fromisoformat(payload.start_month + "-01")
         if payload.end_month:
             end = date.fromisoformat(payload.end_month + "-01")
+            if payload.end_month and start > end:
+                raise HTTPException(
+                    status_code=400,
+                    detail="start_month must be less than or equal to end_month"
+                )
             filters.append(ShiftAllowances.duration_month.between(start, end))
         else:
             filters.append(ShiftAllowances.duration_month == start)
 
-    elif payload.year:
-        filters.append(extract("year", ShiftAllowances.duration_month) == payload.year)
+    elif payload.selected_year:
+        filters.append(
+            extract("year", ShiftAllowances.duration_month) == payload.selected_year
+        )
 
-        if payload.months:
-            month_nums = [MONTH_MAP[m] for m in payload.months]
-            filters.append(extract("month", ShiftAllowances.duration_month).in_(month_nums))
+        if payload.selected_months:
+            month_nums = [int(m) for m in payload.selected_months]
+            filters.append(
+                extract("month", ShiftAllowances.duration_month).in_(month_nums)
+            )
 
-        if payload.quarters:
+        if payload.selected_quarters:
             quarter_months = set()
-            for q in payload.quarters:
+            for q in payload.selected_quarters:
                 quarter_months.update(QUARTER_MAP[q])
-            filters.append(extract("month", ShiftAllowances.duration_month).in_(quarter_months))
+            filters.append(
+                extract("month", ShiftAllowances.duration_month).in_(quarter_months)
+            )
 
     q = (
         db.query(
@@ -602,7 +613,6 @@ def get_client_dashboard_summary(db: Session, payload: DashboardFilterRequest):
         dashboard[f"shift_{shift}"]["total"] += allowance
         dashboard[f"shift_{shift}"]["head_count"].add(emp_id)
 
-        # ---------- CLIENT ----------
         client_data = dashboard["clients"].setdefault(client, {
             "total_allowance": 0,
             "head_count": set(),
@@ -626,7 +636,6 @@ def get_client_dashboard_summary(db: Session, payload: DashboardFilterRequest):
         dept_data[f"shift_{shift}"]["total"] += allowance
         dept_data[f"shift_{shift}"]["head_count"].add(emp_id)
 
-        # ---------- ACCOUNT MANAGER ----------
         am_data = dashboard["account_manager"].setdefault(am, {
             "total_allowance": 0,
             "head_count": set(),

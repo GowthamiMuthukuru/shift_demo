@@ -55,12 +55,9 @@ class DashboardFilterRequest(BaseModel):
     start_month: Optional[str] = None
     end_month: Optional[str] = None
 
-    year: Optional[int] = None
-    months: Optional[List[Literal[
-        "January","February","March","April","May","June",
-        "July","August","September","October","November","December"
-    ]]] = None
-    quarters: Optional[List[Literal["Q1","Q2","Q3","Q4"]]] = None
+    selected_year: Optional[int] = None
+    selected_months: Optional[List[str]] = None
+    selected_quarters: Optional[List[Literal["Q1","Q2","Q3","Q4"]]] = None
 
     @field_validator("top")
     def validate_top(cls, v):
