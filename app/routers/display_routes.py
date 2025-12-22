@@ -9,7 +9,7 @@ from sqlalchemy import func,distinct
 import pandas as pd
 from io import BytesIO
 from fastapi.responses import StreamingResponse
-
+from utils.client_enums import Company
 
 router = APIRouter(prefix="/display")
 
@@ -83,3 +83,7 @@ def display_account_manger(
     .all())
     names = [name[0] for name in account_managers]
     return {"account_managers":names}
+
+@router.get("/client-enum")
+def get_client_enum(current_user = Depends(get_current_user)):
+                    return{company.value:company.name.replace("_"," ") for company in Company}
