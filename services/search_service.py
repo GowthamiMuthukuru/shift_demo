@@ -2,21 +2,37 @@ from datetime import datetime, date
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
 from sqlalchemy import func
+import re
 
 from models.models import ShiftAllowances, ShiftMapping, ShiftsAmount
 from utils.client_enums import Company
 
 
 def validate_not_future_month(month_str: str, field_name: str):
-    month_date = datetime.strptime(month_str, "%Y-%m").date().replace(day=1)
-    today = date.today().replace(day=1)
+    
 
+    if not re.fullmatch(r"\d{4}-\d{2}", month_str):
+        raise HTTPException(
+            status_code=400,
+            detail=f"{field_name} must be in YYYY-MM format"
+        )
+
+   
+    try:
+        month_date = datetime.strptime(month_str, "%Y-%m").date().replace(day=1)
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid {field_name} value"
+        )
+
+   
+    today = date.today().replace(day=1)
     if month_date > today:
         raise HTTPException(
             status_code=400,
             detail=f"{field_name} cannot be a future month"
         )
-
 
 def export_filtered_excel(
     db: Session,
@@ -29,6 +45,8 @@ def export_filtered_excel(
     start: int = 0,
     limit: int = 10,
 ):
+
+   
     rates = {
         r.shift_type.upper(): float(r.amount or 0)
         for r in db.query(ShiftsAmount).all()
@@ -58,7 +76,6 @@ def export_filtered_excel(
         if not start_month:
             raise HTTPException(404, "No data found in last 12 months")
 
-   
     if end_month and not start_month:
         raise HTTPException(400, "start_month is required when end_month is provided")
 
@@ -71,6 +88,7 @@ def export_filtered_excel(
     if start_month and end_month and start_month > end_month:
         raise HTTPException(400, "start_month cannot be greater than end_month")
 
+  
     base = db.query(
         ShiftAllowances.id,
         ShiftAllowances.emp_id,
@@ -94,6 +112,7 @@ def export_filtered_excel(
             func.to_char(ShiftAllowances.duration_month, "YYYY-MM") == start_month
         )
 
+
     if emp_id:
         base = base.filter(func.upper(ShiftAllowances.emp_id).like(f"%{emp_id.upper()}%"))
     if account_manager:
@@ -103,12 +122,17 @@ def export_filtered_excel(
     if client:
         base = base.filter(func.upper(ShiftAllowances.client).like(f"%{client.upper()}%"))
 
-    
     total_records = base.count()
     if total_records == 0:
         raise HTTPException(404, "No data found")
 
-    
+    subq = base.subquery()
+
+    head_count = (
+        db.query(func.count(func.distinct(subq.c.emp_id)))
+        .scalar()
+    )
+
     all_rows = base.all()
 
     paginated_rows = (
@@ -128,10 +152,10 @@ def export_filtered_excel(
         "PRIME": "PRIME(12AM to 9AM)",
     }
 
+    
     overall_shift_details = {v: 0.0 for v in SHIFT_LABELS.values()}
     overall_total_allowance = 0.0
 
-    
     for row in all_rows:
         mappings = db.query(ShiftMapping).filter(
             ShiftMapping.shiftallowance_id == row.id
@@ -139,12 +163,16 @@ def export_filtered_excel(
 
         for m in mappings:
             days = float(m.days or 0)
-            rate = rates.get(m.shift_type.upper(), 0)
+            if days <= 0:
+                continue
 
+            rate = rates.get(m.shift_type.upper(), 0)
             overall_total_allowance += days * rate
+
             label = SHIFT_LABELS.get(m.shift_type.upper(), m.shift_type)
             overall_shift_details[label] += days
 
+ 
     employees = []
 
     for row in paginated_rows:
@@ -165,9 +193,8 @@ def export_filtered_excel(
 
             st = m.shift_type.upper()
             rate = rates.get(st, 0)
-            allowance = days * rate
+            emp_total += days * rate
 
-            emp_total += allowance
             label = SHIFT_LABELS.get(st, st)
             emp_shift_details[label] = emp_shift_details.get(label, 0) + days
 
@@ -183,7 +210,6 @@ def export_filtered_excel(
 
         employees.append(d)
 
-    
     return {
         "total_records": total_records,
         "shift_details": {
@@ -192,6 +218,7 @@ def export_filtered_excel(
                 for k, v in overall_shift_details.items()
                 if v > 0
             },
+            "head_count": head_count,
             "total_allowance": round(overall_total_allowance, 2),
         },
         "data": {
