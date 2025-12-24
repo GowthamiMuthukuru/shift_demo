@@ -1,10 +1,12 @@
+"""Service for exporting client summary data as an Excel file."""
+
+import os
 from datetime import date
 from typing import List, Dict
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
-from sqlalchemy import func, and_
+from sqlalchemy import func, and_, extract
 import pandas as pd
-import os
 
 from models.models import ShiftAllowances, ShiftMapping, ShiftsAmount
 
@@ -12,6 +14,7 @@ from models.models import ShiftAllowances, ShiftMapping, ShiftsAmount
 # ---------------- HELPERS ----------------
 
 def validate_year(year: int):
+    """Validate that the selected year is not invalid or in the future."""
     current_year = date.today().year
     if year <= 0:
         raise HTTPException(400, "selected_year must be greater than 0")
@@ -20,6 +23,7 @@ def validate_year(year: int):
 
 
 def quarter_to_months(q: str) -> List[int]:
+    """Convert quarter string (Q1–Q4) into a list of month numbers."""
     mapping = {
         "Q1": [1, 2, 3],
         "Q2": [4, 5, 6],
@@ -33,6 +37,7 @@ def quarter_to_months(q: str) -> List[int]:
 
 
 def month_range(start: str, end: str) -> Dict[int, List[int]]:
+    """Generate a year-to-months mapping between two YYYY-MM values."""
     sy, sm = map(int, start.split("-"))
     ey, em = map(int, end.split("-"))
 
@@ -58,7 +63,7 @@ def month_range(start: str, end: str) -> Dict[int, List[int]]:
 # ---------------- MAIN SERVICE ----------------
 
 def client_summary_download_service(db: Session, payload: dict) -> str:
-
+    """Generate and export client summary Excel based on filter payload."""
     payload = payload or {}
 
     # ---------------- CLIENT FILTER ----------------
@@ -66,7 +71,7 @@ def client_summary_download_service(db: Session, payload: dict) -> str:
 
     if not clients_payload or clients_payload == "ALL":
         normalized_clients = {}
-        is_all_clients = True
+        _is_all_clients = True
 
         # ✅ ONLY CHANGE: default latest month if no filters
         if (
@@ -93,7 +98,7 @@ def client_summary_download_service(db: Session, payload: dict) -> str:
             c.lower(): [d.lower() for d in (depts or [])]
             for c, depts in clients_payload.items()
         }
-        is_all_clients = False
+        _is_all_clients = False
     else:
         raise HTTPException(400, "clients must be 'ALL' or client -> departments")
 
@@ -146,8 +151,8 @@ def client_summary_download_service(db: Session, payload: dict) -> str:
             months = [int(m) for m in selected_months]
         else:
             latest_month = (
-                db.query(func.max(func.extract("month", ShiftAllowances.duration_month)))
-                .filter(func.extract("year", ShiftAllowances.duration_month) == year)
+                db.query(func.max(extract("month", ShiftAllowances.duration_month)))
+                .filter(extract("year", ShiftAllowances.duration_month) == year)
                 .scalar()
             )
             if not latest_month:
@@ -176,6 +181,7 @@ def client_summary_download_service(db: Session, payload: dict) -> str:
 # ---------------- QUERY & DF HELPERS ----------------
 
 def fetch_rows(db, year: int, months: List[int], normalized_clients: dict):
+    """Fetch shift allowance rows for given year, months, and client filters."""
     query = (
         db.query(
             ShiftAllowances.duration_month,
@@ -198,8 +204,8 @@ def fetch_rows(db, year: int, months: List[int], normalized_clients: dict):
             ),
         )
         .filter(
-            func.extract("year", ShiftAllowances.duration_month) == year,
-            func.extract("month", ShiftAllowances.duration_month).in_(months),
+            extract("year", ShiftAllowances.duration_month) == year,
+            extract("month", ShiftAllowances.duration_month).in_(months),
         )
     )
 
@@ -222,6 +228,7 @@ def fetch_rows(db, year: int, months: List[int], normalized_clients: dict):
 
 
 def build_dataframe(rows):
+    """Build a Pandas DataFrame aggregating shift data per employee per month."""
     grouped = {}
 
     for r in rows:
