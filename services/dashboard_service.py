@@ -1,18 +1,19 @@
-from sqlalchemy.orm import Session
-from sqlalchemy import extract
-from datetime import datetime,date
+"""Dashboard analytics services for horizontal, vertical, graph, and summary views."""
+
+from typing import List
 from decimal import Decimal
+from datetime import datetime,date
+from sqlalchemy.orm import Session
 from fastapi import HTTPException
-from models.models import ShiftAllowances, ShiftsAmount, ShiftMapping
 from dateutil.relativedelta import relativedelta
 from sqlalchemy import func,extract,Integer,or_
-from typing import List
+from models.models import ShiftAllowances, ShiftsAmount, ShiftMapping
 from utils.client_enums import Company
-from collections import defaultdict
 from schemas.dashboardschema import DashboardFilterRequest
 
 
 def validate_month_format(month: str):
+    """Validate and parse a YYYY-MM month string into a date."""
     try:
         return datetime.strptime(month + "-01", "%Y-%m-%d").date()
     except:
@@ -27,11 +28,15 @@ def _map_client_names(client_value: str):
     """
     for c in Company:
         if c.value == client_value or c.name == client_value:
-            return c.value, c.name  
+            return c.value, c.name
 
     return client_value, client_value
 
-def get_horizontal_bar_service(db: Session, start_month: str | None, end_month: str | None, top: int | None):
+def get_horizontal_bar_service(db: Session,
+                               start_month: str | None,
+                               end_month: str | None,
+                               top: int | None):
+    """Return horizontal bar summary of employees and shifts per client."""
     if start_month is None:
         latest = db.query(func.max(ShiftAllowances.duration_month)).scalar()
         if latest is None:
@@ -109,6 +114,7 @@ def get_graph_service(
     start_month: str | None = None,
     end_month: str | None = None
 ):
+    """Return monthly allowance trend for a given client."""
     if not client_name:
         raise HTTPException(status_code=400, detail="client_name is required")
 
@@ -218,6 +224,7 @@ def get_graph_service(
 
 
 def get_all_clients_service(db: Session):
+    """Fetch distinct list of all clients."""
     clients = db.query(ShiftAllowances.client).distinct().all()
     client_list = [c[0] for c in clients if c[0]]
     return {"clients": client_list}
@@ -229,6 +236,7 @@ def get_piechart_shift_summary(
     end_month: str | None,
     top: str | None
 ):
+    """Generate pie chart summary of shift distribution across clients."""
     if top is None:
         top_int = None
     else:
@@ -349,7 +357,7 @@ def get_piechart_shift_summary(
         )
 
     result = []
-    for key, info in combined.items():
+    for _key, info in combined.items():
         total_days = (
             info["shift_a"]
             + info["shift_b"]
@@ -383,6 +391,7 @@ def get_vertical_bar_service(
     end_month: str | None = None,
     top: str | None = None
 ) -> List[dict]:
+    """Return vertical bar summary of total days and allowances per client."""
 
     if top is None:
         top_int = None
@@ -520,6 +529,7 @@ SHIFT_TYPES = ["A", "B", "C", "PRIME"]
 
 
 def get_client_dashboard_summary(db: Session, payload: DashboardFilterRequest):
+    """Generate hierarchical dashboard summary grouped by client, department, and account manager."""
 
     if payload.start_month and payload.selected_year:
         raise HTTPException(
@@ -708,5 +718,5 @@ def get_client_dashboard_summary(db: Session, payload: DashboardFilterRequest):
             reverse=True
         )
     )
-    
+
     return {"dashboard": dashboard}
