@@ -1,18 +1,29 @@
+"""Service for generating department-wise shift allowance summaries."""
+
 from sqlalchemy.orm import Session
 from sqlalchemy import func, case
 from models.models import ShiftAllowances, ShiftsAmount, ShiftMapping
 
 def get_department_summary(db: Session, month: str):
+    """Return department-wise, client-wise, and employee-wise allowance summary for a given month."""
     query = (
         db.query(
             ShiftAllowances.department,
             ShiftAllowances.client,
             ShiftAllowances.emp_id,
             ShiftAllowances.emp_name,
-            func.sum(case((ShiftMapping.shift_type == "A", ShiftsAmount.amount), else_=0)).label("shift_a_amount"),
-            func.sum(case((ShiftMapping.shift_type == "B", ShiftsAmount.amount), else_=0)).label("shift_b_amount"),
-            func.sum(case((ShiftMapping.shift_type == "C", ShiftsAmount.amount), else_=0)).label("shift_c_amount"),
-            func.sum(case((ShiftMapping.shift_type == "PRIME", ShiftsAmount.amount), else_=0)).label("prime_amount"),
+            func.sum(
+                case((ShiftMapping.shift_type == "A", ShiftsAmount.amount), else_=0))
+                .label("shift_a_amount"),
+            func.sum(
+                case((ShiftMapping.shift_type == "B", ShiftsAmount.amount), else_=0))
+                .label("shift_b_amount"),
+            func.sum(
+                case((ShiftMapping.shift_type == "C", ShiftsAmount.amount), else_=0))
+                .label("shift_c_amount"),
+            func.sum(
+                case((ShiftMapping.shift_type == "PRIME", ShiftsAmount.amount), else_=0))
+                .label("prime_amount"),
             func.sum(ShiftsAmount.amount).label("total_allowance")
         )
         .join(ShiftMapping, ShiftMapping.shiftallowance_id == ShiftAllowances.id)
