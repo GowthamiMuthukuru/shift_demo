@@ -1,7 +1,18 @@
+"""
+Client enum definitions and deterministic color generation utilities.
+
+This module defines supported client companies and provides a deterministic
+color generation mechanism using OKLCH color space. Colors are generated
+in a way that ensures good contrast and avoids duplicates across clients.
+"""
+
 from enum import Enum
 import hashlib
 import math
 class Company(Enum):
+    """
+    Enumeration of supported client companies.
+    """
     ALASKA_COMMUNICATIONS="Alaska Communications Systems Holdings Inc"
     YMCA="National Council of Young Men's Christian Association of the USA of America"
     MOURITECH_LLC="MOURI Tech LLC"
@@ -58,6 +69,17 @@ class Company(Enum):
 
 
 def _oklch_to_hex(L_pct: float, C: float, h: float) -> str:
+    """
+    Convert OKLCH color values to a HEX color string.
+
+    Args:
+        lightness_pct (float): Lightness percentage (0–100).
+        chroma (float): Chroma value.
+        hue (float): Hue angle in degrees.
+
+    Returns:
+        str: HEX color string.
+    """
     L = L_pct / 100.0
     a = C * math.cos(math.radians(h))
     b = C * math.sin(math.radians(h))
@@ -105,6 +127,18 @@ PALETTE = [
 
 
 def generate_unique_colors(enum_cls):
+    """
+    Generate unique HEX colors for enum members.
+
+    Colors are deterministically derived from enum names and adjusted
+    to avoid duplicates while maintaining contrast.
+
+    Args:
+        enum_cls (Enum): Enum class to generate colors for.
+
+    Returns:
+        dict: Mapping of enum member to HEX color string.
+    """
     color_map = {}
     used = set()
 
