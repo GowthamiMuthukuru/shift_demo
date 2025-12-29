@@ -1,8 +1,20 @@
+"""
+API router aggregation module.
+
+This module registers and aggregates all application-level API routers
+into a single FastAPI router instance. Each feature-specific router
+(authentication, uploads, summaries, dashboards, searches, and reports)
+is included here with appropriate tags for API documentation.
+
+This acts as the central routing configuration for the application.
+"""
+
 from fastapi import APIRouter
 from app.routers import (auth_routes, client_comparision_routes,upload_routes,display_routes,
                          summary_routes,get_excel_routes,search_routes,
                          get_interval_summary_routes,dashboard_routes,
-                         search_month_routes,client_summary_routes,department_summary_routes,client_summary_download_routes)
+                         search_month_routes,client_summary_routes,
+                         department_summary_routes,client_summary_download_routes)
 
 
 router = APIRouter()
