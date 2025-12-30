@@ -1,3 +1,10 @@
+"""
+Client summary download API test cases.
+
+This module contains integration tests for the `/client-summary/download`
+endpoint, validating successful downloads, error handling for invalid
+clients, and scenarios where no data is available.
+"""
 
 from datetime import date
 from fastapi.testclient import TestClient
@@ -8,8 +15,15 @@ from services import client_summary_download_service as service
 DOWNLOAD_URL = "/client-summary/download"
 
 
-# HELPER FUNCTION 
+# HELPER FUNCTION
 def setup_data(db):
+    """
+    Helper function to seed database with valid shift allowance,
+    shift mapping, and shift amount data for download tests.
+
+    Args:
+        db: Database session fixture.
+    """
     db.query(ShiftMapping).delete()
     db.query(ShiftsAmount).delete()
     db.query(ShiftAllowances).delete()
@@ -37,9 +51,13 @@ def setup_data(db):
 # /client-summary/download API TESTCASES
 
 def test_download_all_clients(client: TestClient, db_session, monkeypatch):
+    """
+    Verify successful download when requesting data for all clients.
+    """
     setup_data(db_session)
 
     def mock_fetch_rows(*args, **kwargs):
+        """Mock service fetch_rows response."""
         class Row:
             duration_month = date(2024, 1, 1)
             client = "ClientA"
@@ -65,6 +83,10 @@ def test_download_all_clients(client: TestClient, db_session, monkeypatch):
 
 
 def test_download_valid_client_but_no_data(client: TestClient, db_session):
+    """
+    Verify 404 response when a valid client is provided
+    but no data exists for the selected filters.
+    """
     setup_data(db_session)
 
     payload = {
@@ -77,6 +99,9 @@ def test_download_valid_client_but_no_data(client: TestClient, db_session):
 
 
 def test_download_invalid_client_name(client: TestClient, db_session):
+    """
+    Verify 404 response when an invalid client name is provided.
+    """
     setup_data(db_session)
 
     payload = {
@@ -89,6 +114,9 @@ def test_download_invalid_client_name(client: TestClient, db_session):
 
 
 def test_download_no_data(client: TestClient, db_session):
+    """
+    Verify 404 response when no shift data exists in the system.
+    """
     db_session.query(ShiftMapping).delete()
     db_session.query(ShiftsAmount).delete()
     db_session.query(ShiftAllowances).delete()
