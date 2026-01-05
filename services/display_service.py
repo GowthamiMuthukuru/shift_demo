@@ -289,7 +289,7 @@ def update_shift_service(
 
         rate = rates.get(stype, 0.0)
         mapping.total_allowance = float(days) * rate
-
+    rec.updated_at = datetime.utcnow()
     db.commit()
     db.refresh(rec)
 
