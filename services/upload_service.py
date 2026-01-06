@@ -1,5 +1,6 @@
 """Services for validating, processing, and uploading shift allowance Excel files."""
-
+from diskcache import Cache
+from sqlalchemy import func
 import os
 import uuid
 import io
@@ -19,6 +20,8 @@ from utils.enums import ExcelColumnMap
 
 TEMP_FOLDER = "media/error_excels"
 os.makedirs(TEMP_FOLDER, exist_ok=True)
+cache = Cache("./diskcache/latest_month")
+LATEST_MONTH_KEY = "client_summary:latest_month"
 
 MONTH_MAP = {
     "Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4,
@@ -26,6 +29,20 @@ MONTH_MAP = {
     "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12
 }
 
+def should_invalidate_latest_month_cache(
+    db: Session,
+    excel_duration_months: set[date]
+) -> bool:
+    """
+    Return True if any duration_month in Excel matches
+    the current latest duration_month in DB.
+    """
+    latest_month = db.query(func.max(ShiftAllowances.duration_month)).scalar()
+    if not latest_month:
+        return False
+
+    latest_month = latest_month.replace(day=1)
+    return latest_month in excel_duration_months
 
 def make_json_safe(obj):
     if isinstance(obj, (datetime, date)):
@@ -228,6 +245,9 @@ async def process_excel_upload(file, db: Session, user, base_url: str):
             "duration_month", "payroll_month",
             "billability_status", "practice_remarks", "rmg_comments",
         }
+        excel_duration_months = set(d.replace(day=1)
+                                    for d in clean_df["duration_month"]
+                                    if d is not None)
 
         for row in clean_df.to_dict(orient="records"):
             delete_existing_emp_month(
@@ -263,6 +283,8 @@ async def process_excel_upload(file, db: Session, user, base_url: str):
             inserted += 1
 
         db.commit()
+        if should_invalidate_latest_month_cache(db, excel_duration_months):
+            cache.pop(LATEST_MONTH_KEY, None)
 
         if error_rows:
             raise HTTPException(
