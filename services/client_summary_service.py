@@ -82,7 +82,6 @@ def client_summary_service(db: Session, payload: dict):
     if is_default_latest_month_request(payload):
         cached = cache.get(LATEST_MONTH_KEY)
         if cached:
-            print("CACHE HIT: latest month")
             return cached["data"]
     # ---------------------------------------------------
 
@@ -102,8 +101,8 @@ def client_summary_service(db: Session, payload: dict):
         if not selected_year and not selected_months and not selected_quarters and not start_month and not end_month:
             latest_month_obj = db.query(func.max(ShiftAllowances.duration_month)).scalar()
             if not latest_month_obj:
-                today = date.today()
-                latest_month_obj = date(today.year, today.month, 1)
+                raise HTTPException(404, "No data available in database")
+
             months = [date(latest_month_obj.year, latest_month_obj.month, 1)]
             selected_year = str(latest_month_obj.year)
 
@@ -116,29 +115,34 @@ def client_summary_service(db: Session, payload: dict):
         if not selected_year and not selected_months and not selected_quarters and not start_month and not end_month:
             latest_month = db.query(func.max(ShiftAllowances.duration_month)).scalar()
             if not latest_month:
-                raise HTTPException(404, "No data available")
+                raise HTTPException(404, "No data available in database")
+
             months = [date(latest_month.year, latest_month.month, 1)]
             selected_year = str(latest_month.year)
+
     else:
         raise HTTPException(400, "clients must be 'ALL' or a mapping of client -> departments")
 
+    # ---------------- VALIDATION ----------------
     if (selected_months or selected_quarters) and not selected_year:
-        raise HTTPException(400, "selected_year is mandatory when using selected_months or selected_quarters")
+        raise HTTPException(400, "selected_year is mandatory")
 
     quarter_map: Dict[str, List[date]] = {}
 
+    # ---------------- DATE FILTERS ----------------
     if start_month and end_month:
         months = month_range(parse_yyyy_mm(start_month), parse_yyyy_mm(end_month))
+
     elif selected_months:
         validate_year(int(selected_year))
-        y = int(selected_year)
-        months = [date(y, int(m), 1) for m in selected_months]
+        months = [date(int(selected_year), int(m), 1) for m in selected_months]
+
     elif selected_quarters:
         validate_year(int(selected_year))
-        y = int(selected_year)
         for q in selected_quarters:
-            mlist = [date(y, m, 1) for m in quarter_to_months(q)]
+            mlist = [date(int(selected_year), m, 1) for m in quarter_to_months(q)]
             quarter_map[f"{mlist[0]:%Y-%m} - {mlist[-1]:%Y-%m}"] = mlist
+
     elif not months:
         raise HTTPException(400, "No valid date filter provided")
 
@@ -149,7 +153,7 @@ def client_summary_service(db: Session, payload: dict):
             response[q] = {"message": f"No data found for {q}"}
     else:
         for m in months:
-            response[m.strftime("%Y-%m")] = {"message": f"No data found"}
+            response[m.strftime("%Y-%m")] = {"message": f"No data found for {m:%Y-%m}"}
 
     # ---------------- DB QUERY ----------------
     query = (
@@ -177,37 +181,36 @@ def client_summary_service(db: Session, payload: dict):
 
     if normalized_clients:
         filters = []
-        for client_name, dept_list in normalized_clients.items():
-            if dept_list:
-                filters.append(
-                    and_(
-                        func.lower(ShiftAllowances.client) == client_name,
-                        func.lower(ShiftAllowances.department).in_(dept_list),
-                    )
-                )
+        for c, depts in normalized_clients.items():
+            if depts:
+                filters.append(and_(
+                    func.lower(ShiftAllowances.client) == c,
+                    func.lower(ShiftAllowances.department).in_(depts),
+                ))
             else:
-                filters.append(func.lower(ShiftAllowances.client) == client_name)
+                filters.append(func.lower(ShiftAllowances.client) == c)
         query = query.filter(or_(*filters))
 
-    date_filters = months if months else [m for ml in quarter_map.values() for m in ml]
-    query = query.filter(
-        or_(*[
-            and_(
-                func.extract("year", ShiftAllowances.duration_month) == m.year,
-                func.extract("month", ShiftAllowances.duration_month) == m.month,
-            )
-            for m in date_filters
-        ])
+    date_list = (
+        [m for ml in quarter_map.values() for m in ml]
+        if selected_quarters else months
     )
+
+    query = query.filter(or_(*[
+        and_(
+            func.extract("year", ShiftAllowances.duration_month) == m.year,
+            func.extract("month", ShiftAllowances.duration_month) == m.month,
+        )
+        for m in date_list
+    ]))
 
     rows = query.all()
 
     # ---------------- POPULATE RESPONSE ----------------
     for dm, client, dept, emp_id, emp_name, acc_mgr, stype, days, amt in rows:
         period_key = (
-            next(q for q, mlist in quarter_map.items() if dm.replace(day=1) in mlist)
-            if selected_quarters
-            else dm.strftime("%Y-%m")
+            next(q for q, ml in quarter_map.items() if dm.replace(day=1) in ml)
+            if selected_quarters else dm.strftime("%Y-%m")
         )
 
         if "message" in response.get(period_key, {}):
@@ -262,11 +265,14 @@ def client_summary_service(db: Session, payload: dict):
 
     # ---------- CACHE WRITE (LATEST MONTH ONLY) ----------
     if is_default_latest_month_request(payload):
-        cache.set(LATEST_MONTH_KEY,{
-            "_cached_month": months[0].strftime("%Y-%m"),
-            "data": response
+        cache.set(
+            LATEST_MONTH_KEY,
+            {
+                "_cached_month": months[0].strftime("%Y-%m"),
+                "data": response,
             },
-            expire=CACHE_TTL)
+            expire=CACHE_TTL,
+        )
     # ---------------------------------------------------
 
     return response
