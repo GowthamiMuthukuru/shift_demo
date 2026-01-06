@@ -1,7 +1,7 @@
 # Environment files
 .env
 *.env
-
+diskcache/
 # Python cache and build artifacts
 __pycache__/
 *.pyc
