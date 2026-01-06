@@ -7,7 +7,7 @@ from fastapi import HTTPException
 from sqlalchemy.orm import Session
 from sqlalchemy import func, and_, extract
 import pandas as pd
-
+from services.client_summary_service import client_summary_service
 from models.models import ShiftAllowances, ShiftMapping, ShiftsAmount
 
 
@@ -63,197 +63,49 @@ def month_range(start: str, end: str) -> Dict[int, List[int]]:
 # ---------------- MAIN SERVICE ----------------
 
 def client_summary_download_service(db: Session, payload: dict) -> str:
-    """Generate and export client summary Excel based on filter payload."""
-    payload = payload or {}
+    """
+    Generate and export client summary Excel
+    using client_summary_service output.
+    """
 
-    # ---------------- CLIENT FILTER ----------------
-    clients_payload = payload.get("clients")
+    # ✅ Reuse existing logic (cache included)
+    summary_data = client_summary_service(db, payload)
 
-    if not clients_payload or clients_payload == "ALL":
-        normalized_clients = {}
-        _is_all_clients = True
+    if not summary_data:
+        raise HTTPException(404, "No data available")
 
-        # ✅ ONLY CHANGE: default latest month if no filters
-        if (
-            not payload.get("selected_year")
-            and not payload.get("selected_months")
-            and not payload.get("selected_quarters")
-            and not payload.get("start_month")
-            and not payload.get("end_month")
-        ):
-            latest_month_obj = (
-                db.query(func.max(ShiftAllowances.duration_month))
-                .scalar()
-            )
+    rows = []
 
-            if not latest_month_obj:
-                today = date.today()
-                latest_month_obj = date(today.year, today.month, 1)
+    for period_key, period_data in summary_data.items():
+        if "clients" not in period_data:
+            continue
 
-            payload["selected_year"] = str(latest_month_obj.year)
-            payload["selected_months"] = [latest_month_obj.month]
+        for client_name, client_block in period_data["clients"].items():
+            for dept_name, dept_block in client_block["departments"].items():
+                for emp in dept_block.get("employees", []):
+                    rows.append({
+                        "Period": period_key,
+                        "Client": client_name,
+                        "Department": dept_name,
+                        "Employee ID": emp.get("emp_id"),
+                        "Employee Name": emp.get("emp_name"),
+                        "Account Manager": emp.get("account_manager"),
+                        "Shift A": emp.get("A", 0),
+                        "Shift B": emp.get("B", 0),
+                        "Shift C": emp.get("C", 0),
+                        "Prime": emp.get("PRIME", 0),
+                        "Total Allowance": emp.get("total", 0),
+                    })
 
-    elif isinstance(clients_payload, dict):
-        normalized_clients = {
-            c.lower(): [d.lower() for d in (depts or [])]
-            for c, depts in clients_payload.items()
-        }
-        _is_all_clients = False
-    else:
-        raise HTTPException(400, "clients must be 'ALL' or client -> departments")
+    if not rows:
+        raise HTTPException(404, "No data available for export")
 
-    start_month = payload.get("start_month")
-    end_month = payload.get("end_month")
-    selected_year = payload.get("selected_year")
-    selected_months = payload.get("selected_months", [])
-    selected_quarters = payload.get("selected_quarters", [])
-
-    data_frames = []
-    missing_months = []
-
-    # ---------------- RANGE MODE ----------------
-    if start_month and end_month:
-        year_month_map = month_range(start_month, end_month)
-
-        for year, months in year_month_map.items():
-            rows = fetch_rows(db, year, months, normalized_clients)
-
-            if not rows:
-                for m in months:
-                    missing_months.append(f"{year}-{m:02d}")
-                continue
-
-            data_frames.append(build_dataframe(rows))
-
-        if missing_months:
-            raise HTTPException(
-                404,
-                f"No data available for months: {', '.join(missing_months)}"
-            )
-
-    # ---------------- MONTH / QUARTER MODE ----------------
-    else:
-        if (selected_months or selected_quarters) and not selected_year:
-            raise HTTPException(
-                400,
-                "selected_year is mandatory when using selected_months or selected_quarters"
-            )
-
-        year = int(selected_year) if selected_year else date.today().year
-        validate_year(year)
-
-        months: List[int] = []
-
-        if selected_quarters:
-            for q in selected_quarters:
-                months.extend(quarter_to_months(q))
-        elif selected_months:
-            months = [int(m) for m in selected_months]
-        else:
-            latest_month = (
-                db.query(func.max(extract("month", ShiftAllowances.duration_month)))
-                .filter(extract("year", ShiftAllowances.duration_month) == year)
-                .scalar()
-            )
-            if not latest_month:
-                raise HTTPException(404, "No data available for the current year")
-            months = [int(latest_month)]
-
-        rows = fetch_rows(db, year, months, normalized_clients)
-
-        if not rows:
-            raise HTTPException(404, "No data available for selected filters")
-
-        data_frames.append(build_dataframe(rows))
-
-    # ---------------- EXPORT ----------------
-    final_df = pd.concat(data_frames, ignore_index=True)
+    df = pd.DataFrame(rows)
 
     os.makedirs("exports", exist_ok=True)
     file_path = "exports/client_summary.xlsx"
 
     with pd.ExcelWriter(file_path, engine="openpyxl") as writer:
-        final_df.to_excel(writer, index=False, sheet_name="Client Summary")
+        df.to_excel(writer, index=False, sheet_name="Client Summary")
 
     return file_path
-
-
-# ---------------- QUERY & DF HELPERS ----------------
-
-def fetch_rows(db, year: int, months: List[int], normalized_clients: dict):
-    """Fetch shift allowance rows for given year, months, and client filters."""
-    query = (
-        db.query(
-            ShiftAllowances.duration_month,
-            ShiftAllowances.client,
-            ShiftAllowances.department,
-            ShiftAllowances.emp_id,
-            ShiftAllowances.emp_name,
-            ShiftAllowances.account_manager,
-            ShiftMapping.shift_type,
-            ShiftMapping.days,
-            ShiftsAmount.amount,
-        )
-        .join(ShiftMapping, ShiftMapping.shiftallowance_id == ShiftAllowances.id)
-        .join(
-            ShiftsAmount,
-            and_(
-                ShiftsAmount.shift_type == ShiftMapping.shift_type,
-                ShiftsAmount.payroll_year
-                == func.to_char(ShiftAllowances.payroll_month, "YYYY"),
-            ),
-        )
-        .filter(
-            extract("year", ShiftAllowances.duration_month) == year,
-            extract("month", ShiftAllowances.duration_month).in_(months),
-        )
-    )
-
-    rows = []
-    for r in query.all():
-        client = (r.client or "").lower()
-        dept = (r.department or "").lower()
-
-        if normalized_clients:
-            matched = next((c for c in normalized_clients if c in client), None)
-            if not matched:
-                continue
-            allowed = normalized_clients[matched]
-            if allowed and dept not in allowed:
-                continue
-
-        rows.append(r)
-
-    return rows
-
-
-def build_dataframe(rows):
-    """Build a Pandas DataFrame aggregating shift data per employee per month."""
-    grouped = {}
-
-    for r in rows:
-        key = (r.duration_month.strftime("%Y-%m"), r.emp_id)
-
-        if key not in grouped:
-            grouped[key] = {
-                "Year-Month": r.duration_month.strftime("%Y-%m"),
-                "Client": r.client,
-                "Department": r.department,
-                "Employee ID": r.emp_id,
-                "Employee Name": r.emp_name,
-                "Account Manager": r.account_manager,
-                "Shift Type-Days": {},
-                "Total Allowance": 0,
-            }
-
-        grouped[key]["Shift Type-Days"][r.shift_type] = r.days
-        grouped[key]["Total Allowance"] += float(r.days or 0) * float(r.amount or 0)
-
-    data = []
-    for g in grouped.values():
-        g["Shift Type-Days"] = ",".join(
-            f"{stype}-{days}" for stype, days in g.pop("Shift Type-Days").items()
-        )
-        data.append(g)
-
-    return pd.DataFrame(data)
