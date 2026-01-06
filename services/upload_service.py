@@ -33,16 +33,18 @@ def should_invalidate_latest_month_cache(
     db: Session,
     excel_duration_months: set[date]
 ) -> bool:
-    """
-    Return True if any duration_month in Excel matches
-    the current latest duration_month in DB.
-    """
-    latest_month = db.query(func.max(ShiftAllowances.duration_month)).scalar()
-    if not latest_month:
+    cached = cache.get(LATEST_MONTH_KEY)
+    if not cached:
         return False
 
-    latest_month = latest_month.replace(day=1)
-    return latest_month in excel_duration_months
+    cached_month_str = cached.get("_cached_month")
+    if not cached_month_str:
+        return True  # defensive: unknown cache state
+
+    cached_month = datetime.strptime(cached_month_str, "%Y-%m").date()
+
+    # If Excel contains a month >= cached month → invalidate
+    return any(m >= cached_month for m in excel_duration_months)
 
 def make_json_safe(obj):
     if isinstance(obj, (datetime, date)):

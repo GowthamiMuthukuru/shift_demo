@@ -83,7 +83,7 @@ def client_summary_service(db: Session, payload: dict):
         cached = cache.get(LATEST_MONTH_KEY)
         if cached:
             print("CACHE HIT: latest month")
-            return cached
+            return cached["data"]
     # ---------------------------------------------------
 
     selected_year = payload.get("selected_year")
@@ -262,7 +262,11 @@ def client_summary_service(db: Session, payload: dict):
 
     # ---------- CACHE WRITE (LATEST MONTH ONLY) ----------
     if is_default_latest_month_request(payload):
-        cache.set(LATEST_MONTH_KEY, response, expire=CACHE_TTL)
+        cache.set(LATEST_MONTH_KEY,{
+            "_cached_month": months[0].strftime("%Y-%m"),
+            "data": response
+            },
+            expire=CACHE_TTL)
     # ---------------------------------------------------
 
     return response
