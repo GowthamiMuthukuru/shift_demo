@@ -398,32 +398,21 @@ def get_client_total_allowances(db: Session, start_month: str | None, end_month:
     return result
 
 
-
 def get_client_departments_service(db: Session, client: str | None):
-
 
     if client is not None:
         client = client.strip()
 
         if not isinstance(client, str):
-            raise HTTPException(
-                status_code=400,
-                detail="Client name must be a string"
-            )
+            raise HTTPException(status_code=400, detail="Client name must be a string")
 
         if client == "":
-            raise HTTPException(
-                status_code=400,
-                detail="Client name cannot be empty"
-            )
+            raise HTTPException(status_code=400, detail="Client name cannot be empty")
 
         if client.isdigit():
-            raise HTTPException(
-                status_code=400,
-                detail="Numbers are not allowed, only strings"
-            )
+            raise HTTPException(status_code=400, detail="Numbers are not allowed, only strings")
 
-
+  
     if client:
         rows = (
             db.query(ShiftAllowances.department)
@@ -447,7 +436,7 @@ def get_client_departments_service(db: Session, client: str | None):
             "departments": departments
         }]
 
-
+ 
     rows = (
         db.query(
             ShiftAllowances.client,
@@ -460,7 +449,6 @@ def get_client_departments_service(db: Session, client: str | None):
     result = {}
 
     for client_name, dept in rows:
-
         if not client_name:
             continue
 
@@ -469,10 +457,11 @@ def get_client_departments_service(db: Session, client: str | None):
         if dept:
             result[client_name].add(dept)
 
+
     return [
         {
             "client": c,
-            "departments": sorted(list(depts))
+            "departments": sorted(result[c])
         }
-        for c, depts in result.items()
+        for c in sorted(result.keys())
     ]

@@ -156,11 +156,7 @@ class ClientDeptResponse(BaseModel):
     class Config:
         from_attributes = True
 
-
 class CorrectedRow(BaseModel):
-    """
-    Represents a corrected employee row from Excel upload.
-    """
     emp_id: str
     emp_name: Optional[str] = None
     grade: Optional[str] = None
@@ -172,47 +168,42 @@ class CorrectedRow(BaseModel):
     account_manager: Optional[str] = None
     practice_lead: Optional[str] = None
     delivery_manager: Optional[Union[int, str]] = None
-   
-    duration_month: Optional[str] = Field(None, description="Format: Mon'YY (e.g. Jan'25)")
-    payroll_month: Optional[str] = Field(None, description="Format: Mon'YY (e.g. Jan'25)")
-   
+
+    duration_month: Optional[str] = None
+    payroll_month: Optional[str] = None
+
     shift_a_days: Optional[Union[int, float]] = 0
     shift_b_days: Optional[Union[int, float]] = 0
     shift_c_days: Optional[Union[int, float]] = 0
     prime_days: Optional[Union[int, float]] = 0
-   
-    shift_types: Optional[Union[int, str]] = Field(None, alias="# Shift Types(e)")
+
+    shift_types: Optional[Union[int, str]] = None
     total_days: Optional[Union[int, float]] = 0
-    timesheet_billable_days: Optional[Union[int, float]] = Field(None, alias="Timesheet Billable Days")
-    timesheet_non_billable_days: Optional[Union[int, float]] = Field(None, alias="Timesheet Non Billable Days")
-    diff: Optional[Union[int, float]] = Field(None, alias="Diff")
-    final_total_days: Optional[Union[int, float]] = Field(None, alias="Final Total Days")
-   
+    timesheet_billable_days: Optional[Union[int, float]] = None
+    timesheet_non_billable_days: Optional[Union[int, float]] = None
+    diff: Optional[Union[int, float]] = None
+    final_total_days: Optional[Union[int, float]] = None
+
     billability_status: Optional[str] = None
     practice_remarks: Optional[Union[int, str]] = None
     rmg_comments: Optional[Union[int, str]] = None
-    amar_approval: Optional[Union[int, str]] = Field(None, alias="Amar Approval")
-   
-    shift_a_allowances: Optional[Union[int, float]] = Field(None, alias="Shift A Allowances")
-    shift_b_allowances: Optional[Union[int, float]] = Field(None, alias="Shift B Allowances")
-    shift_c_allowances: Optional[Union[int, float]] = Field(None, alias="Shift C Allowances")
-    prime_allowances: Optional[Union[int, float]] = Field(None, alias="Prime Allowances")
-    total_days_allowances: Optional[Union[int, float]] = Field(None, alias="TOTAL DAYS Allowances")
-   
-    am_email_attempt: Optional[Union[int, str]] = Field(None, alias="AM Email Attempt(e)")  # Changed to Union[int, str]
-    am_approval_status: Optional[Union[int, str]] = Field(None, alias="AM Approval Status(e)")
- 
+    amar_approval: Optional[Union[int, str]] = None
+
+    shift_a_allowances: Optional[Union[int, float]] = None
+    shift_b_allowances: Optional[Union[int, float]] = None
+    shift_c_allowances: Optional[Union[int, float]] = None
+    prime_allowances: Optional[Union[int, float]] = None
+    total_days_allowances: Optional[Union[int, float]] = None
+
+    am_email_attempt: Optional[Union[int, str]] = None
+    am_approval_status: Optional[Union[int, str]] = None
+
     class Config:
-        extra = "ignore"
         populate_by_name = True
- 
- 
+        extra = "ignore"
 
 
 class CorrectedRowsRequest(BaseModel):
-    """
-    Request payload containing multiple corrected rows.
-    """
     corrected_rows: List[CorrectedRow]
 
     class Config:

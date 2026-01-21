@@ -1,13 +1,6 @@
-"""
-Employee search API routes.
+"""Routes for fetching employee shift details."""
 
-This module defines API endpoints for searching and retrieving employee
-shift and allowance details with optional filtering by employee ID,
-account manager, department, client, and month range. The endpoints
-support pagination and are secured using authentication dependencies.
-"""
-
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Body
 from sqlalchemy.orm import Session
 from db import get_db
 from services.search_service import export_filtered_excel
@@ -18,57 +11,54 @@ router = APIRouter(
     tags=["Search Details"]
 )
 
-# pylint: disable=too-many-arguments,too-many-positional-arguments
-@router.get("/search")
+
+@router.post("/search")
 def fetch_employee_details(
-    emp_id: str | None = Query(None),
-    account_manager: str | None = Query(None),
-    department: str | None = Query(None),
-    client: str | None = Query(None),
-    start_month: str | None = Query(None, description="YYYY-MM"),
-    end_month: str | None = Query(None, description="YYYY-MM"),
-    start: int | None = Query(0, ge=0),
-    limit: int | None = Query(10, gt=0),
+    payload: dict = Body(..., example={
+        "emp_id": "IN01804611",
+        "account_manager": "John Doe",
+        "clients": "ALL",
+        "department": "Infra - IT Operations",
+        "start_month": "YYYY-MM",
+        "end_month": "YYYY-MM",
+        "start": 0,
+        "limit": 10,
+        "selected_year": "YYYY",
+        "selected_months": ["01", "02"],
+        "selected_quarters": ["Q1"]
+    }),
     db: Session = Depends(get_db),
     _current_user=Depends(get_current_user),
 ):
     """
-    Fetch employee shift details with flexible search filters.
+    Fetch employee shift details using the provided request body filters.
 
-    This endpoint returns employee-wise shift and allowance information
-    based on the provided query parameters. All filters are optional and
-    can be combined as needed. Pagination is supported using `start`
-    and `limit`.
+    Filters supported:
+    - Employee ID
+    - Account Manager
+    - Single Client (clients)
+    - Optional Department (department)
+    - Start and End Month
+    - Selected Year, Selected Months, Selected Quarters
+    - Pagination (start, limit)
 
-    Args:
-        emp_id (str | None): Filter by employee ID (partial match).
-        account_manager (str | None): Filter by account manager name.
-        department (str | None): Filter by department name.
-        client (str | None): Filter by client name.
-        start_month (str | None): Start month in YYYY-MM format.
-        end_month (str | None): End month in YYYY-MM format.
-        start (int): Pagination offset (default 0).
-        limit (int): Maximum number of records to return (default 10).
-        db (Session): Database session dependency.
-        current_user: Authenticated user context.
+    All validation, filtering, and aggregation is handled by
+    the service layer `export_filtered_excel`.
 
     Returns:
-        dict: Paginated employee shift details with overall summaries.
-
-    Raises:
-        HTTPException:
-            - 400 for invalid query parameters.
-            - 404 if no matching records are found.
+        dict: Employee shift details including shift-wise allowances and totals.
     """
-
     return export_filtered_excel(
         db=db,
-        emp_id=emp_id,
-        account_manager=account_manager,
-        department=department,
-        client=client,
-        start_month=start_month,
-        end_month=end_month,
-        start=start,
-        limit=limit,
+        emp_id=payload.get("emp_id"),
+        account_manager=payload.get("account_manager"),
+        start_month=payload.get("start_month"),
+        end_month=payload.get("end_month"),
+        start=payload.get("start", 0),
+        limit=payload.get("limit", 10),
+        clients=payload.get("client"),
+        department=payload.get("department"),
+        selected_year=payload.get("selected_year"),
+        selected_months=payload.get("selected_months", []),
+        selected_quarters=payload.get("selected_quarters", [])
     )
