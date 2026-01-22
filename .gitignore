@@ -2,7 +2,7 @@
 .env
 *.env
 
-# Python cache (GLOBAL + NESTED)
+# Python cache
 __pycache__/
 **/__pycache__/
 .pytest_cache/
@@ -17,33 +17,30 @@ diskcache/
 
 # Database
 *.db
-test.db
 
 # Virtual environments
 venv/
 .venv/
 
-# Build/packaging
+# Build
 build/
 dist/
 *.egg-info/
 
-# IDE/editor
+# IDE
 .vscode/
 .idea/
 
-# OS files
+# OS
 .DS_Store
 Thumbs.db
 
-# App runtime folders
+# Runtime-generated folders
 media/
 tmp/
 uploads/
-error_excels/
 temp_files/
 exports/
 
 # Tests (ONLY if intentionally excluded)
 Testcases/
-**/Testcases/
