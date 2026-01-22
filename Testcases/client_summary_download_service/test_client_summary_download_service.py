@@ -11,66 +11,102 @@ from fastapi.testclient import TestClient
 from models.models import ShiftAllowances, ShiftMapping, ShiftsAmount
 from services import client_summary_download_service as service
 
-# API ROUTES
+#API ROUTES
 DOWNLOAD_URL = "/client-summary/download"
 
-
-# HELPER FUNCTION
+#HELPER FUNCTION
 def setup_data(db):
     """
-    Helper function to seed database with valid shift allowance,
-    shift mapping, and shift amount data for download tests.
+    Seed the database with valid shift allowance, shift mapping,
+    and shift amount data for download tests.
 
     Args:
-        db: Database session fixture.
+        db: SQLAlchemy database session fixture.
     """
     db.query(ShiftMapping).delete()
     db.query(ShiftsAmount).delete()
     db.query(ShiftAllowances).delete()
 
-    d = date(2024, 1, 1)
-    sa = ShiftAllowances(
+    test_date = date(2024, 1, 1)
+
+    allowance = ShiftAllowances(
         emp_id="E01",
         emp_name="User",
         client="ClientA",
         department="IT",
         account_manager="AM",
-        duration_month=d,
-        payroll_month=d,
+        duration_month=test_date,
+        payroll_month=test_date,
     )
-    db.add(sa)
+
+    db.add(allowance)
     db.flush()
 
-    db.add_all([
-        ShiftMapping(shiftallowance_id=sa.id, shift_type="A", days=5),
-        ShiftsAmount(shift_type="A", payroll_year=2024, amount=100),
-    ])
+    db.add_all(
+        [
+            ShiftMapping(
+                shiftallowance_id=allowance.id,
+                shift_type="A",
+                days=5,
+            ),
+            ShiftsAmount(
+                shift_type="A",
+                payroll_year=2024,
+                amount=100,
+            ),
+        ]
+    )
+
     db.commit()
 
-
 # /client-summary/download API TESTCASES
-
 def test_download_all_clients(client: TestClient, db_session, monkeypatch):
     """
-    Verify successful download when requesting data for all clients.
+    Verify successful Excel download when requesting data
+    for all clients.
     """
     setup_data(db_session)
 
-    def mock_fetch_rows(*args, **kwargs):
-        """Mock service fetch_rows response."""
-        class Row:
-            duration_month = date(2024, 1, 1)
-            client = "ClientA"
-            department = "IT"
-            emp_id = "E01"
-            emp_name = "User"
-            account_manager = "AM"
-            shift_type = "A"
-            days = 5
-            amount = 100
-        return [Row()]
+    def mock_client_summary_service(_db, _payload):
+        """
+        Mock client summary service returning valid summary data.
+        """
+        return {
+            "2024-01": {
+                "clients": {
+                    "ClientA": {
+                        "account_manager": "AM",
+                        "departments": {
+                            "IT": {
+                                "dept_head_count": 1,
+                                "dept_A": 500,
+                                "dept_B": 0,
+                                "dept_C": 0,
+                                "dept_PRIME": 0,
+                                "dept_total": 500,
+                                "employees": [
+                                    {
+                                        "emp_id": "E01",
+                                        "account_manager": "AM",
+                                        "A": 500,
+                                        "B": 0,
+                                        "C": 0,
+                                        "PRIME": 0,
+                                        "total": 500,
+                                    }
+                                ],
+                            }
+                        },
+                    }
+                }
+            }
+        }
 
-    monkeypatch.setattr(service, "fetch_rows", mock_fetch_rows)
+    monkeypatch.setattr(
+        service,
+        "client_summary_service",
+        mock_client_summary_service,
+    )
 
     payload = {
         "clients": "ALL",
@@ -78,54 +114,113 @@ def test_download_all_clients(client: TestClient, db_session, monkeypatch):
         "selected_months": ["01"],
     }
 
-    resp = client.post(DOWNLOAD_URL, json=payload)
-    assert resp.status_code == 200
+    response = client.post(DOWNLOAD_URL, json=payload)
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith(
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
 
 
-def test_download_valid_client_but_no_data(client: TestClient, db_session):
+def test_download_valid_client_but_no_data(
+    client: TestClient,
+    db_session,
+    monkeypatch,
+):
     """
     Verify 404 response when a valid client is provided
     but no data exists for the selected filters.
     """
     setup_data(db_session)
 
+    def mock_empty_summary(_db, _payload):
+        """
+        Mock service returning no summary data.
+        """
+        return {}
+
+    monkeypatch.setattr(
+        service,
+        "client_summary_service",
+        mock_empty_summary,
+    )
+
     payload = {
-        "clients": {"ClientA": []},  
+        "clients": {"ClientA": []},
         "selected_year": "2024",
         "selected_months": ["01"],
     }
-    resp = client.post(DOWNLOAD_URL, json=payload)
-    assert resp.status_code == 404
+
+    response = client.post(DOWNLOAD_URL, json=payload)
+
+    assert response.status_code == 404
+    assert "No data" in response.json()["detail"]
 
 
-def test_download_invalid_client_name(client: TestClient, db_session):
+def test_download_invalid_client_name(
+    client: TestClient,
+    db_session,
+    monkeypatch,
+):
     """
-    Verify 404 response when an invalid client name is provided.
+    Verify 404 response when an invalid client name
+    is provided.
     """
     setup_data(db_session)
 
+    def mock_empty_summary(_db, _payload):
+        """
+        Mock service returning no summary data.
+        """
+        return {}
+
+    monkeypatch.setattr(
+        service,
+        "client_summary_service",
+        mock_empty_summary,
+    )
+
     payload = {
-        "clients": {"InvalidClient": []},  
+        "clients": {"InvalidClient": []},
         "selected_year": "2024",
         "selected_months": ["01"],
     }
-    resp = client.post(DOWNLOAD_URL, json=payload)
-    assert resp.status_code == 404
+
+    response = client.post(DOWNLOAD_URL, json=payload)
+
+    assert response.status_code == 404
+    assert "No data" in response.json()["detail"]
 
 
-def test_download_no_data(client: TestClient, db_session):
+def test_download_no_data(client: TestClient, db_session, monkeypatch):
     """
-    Verify 404 response when no shift data exists in the system.
+    Verify 404 response when no shift data exists
+    in the system.
     """
     db_session.query(ShiftMapping).delete()
     db_session.query(ShiftsAmount).delete()
     db_session.query(ShiftAllowances).delete()
     db_session.commit()
 
+    def mock_empty_summary(_db, _payload):
+        """
+        Mock service returning no summary data.
+        """
+        return {}
+
+    monkeypatch.setattr(
+        service,
+        "client_summary_service",
+        mock_empty_summary,
+    )
+
     payload = {
         "clients": "ALL",
         "selected_year": "2024",
         "selected_months": ["01"],
     }
-    resp = client.post(DOWNLOAD_URL, json=payload)
-    assert resp.status_code == 404
+
+    response = client.post(DOWNLOAD_URL, json=payload)
+
+    assert response.status_code == 404
+    assert "No data" in response.json()["detail"]

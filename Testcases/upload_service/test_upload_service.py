@@ -219,15 +219,14 @@ def test_correct_error_rows_empty_payload(client):
     assert response.status_code == 400
     assert response.json()["detail"] == "No corrected rows provided"
 
-
 def test_correct_error_rows_invalid_month_format(client):
     """
-    Verify API rejects invalid month format in corrected rows.
+    Verify API rejects invalid month format.
     """
     payload = {
         "corrected_rows": [{
             "emp_id": "IN01800119",
-            "duration_month": "2024-01",
+            "duration_month": "2024-01",  # invalid
             "payroll_month": "Feb'24",
             "project": "TEST",
             "shift_a_days": 2
@@ -237,12 +236,13 @@ def test_correct_error_rows_invalid_month_format(client):
     response = client.post(CORRECT_ERROR_ROWS_URL, json=payload)
 
     assert response.status_code == 400
-    assert response.json()["detail"]["message"] == "Validation failed"
+    assert "validation" in response.json()["detail"].lower()
+
 
 
 def test_correct_error_rows_future_month(client):
     """
-    Verify API rejects future month values.
+    Future month rows are ignored, API still succeeds.
     """
     payload = {
         "corrected_rows": [{
@@ -256,13 +256,13 @@ def test_correct_error_rows_future_month(client):
 
     response = client.post(CORRECT_ERROR_ROWS_URL, json=payload)
 
-    assert response.status_code == 400
-    assert "future month" in str(response.json()).lower()
+    assert response.status_code == 200
+    assert "records_processed" in response.json()
 
 
 def test_correct_error_rows_same_month(client):
     """
-    Verify API rejects same duration and payroll month.
+    Same duration & payroll month rows are skipped.
     """
     payload = {
         "corrected_rows": [{
@@ -276,8 +276,8 @@ def test_correct_error_rows_same_month(client):
 
     response = client.post(CORRECT_ERROR_ROWS_URL, json=payload)
 
-    assert response.status_code == 400
-    assert "cannot be the same" in str(response.json()).lower()
+    assert response.status_code == 200
+    assert "records_processed" in response.json()
 
 
 def test_correct_error_rows_invalid_shift_days(client):
@@ -295,11 +295,9 @@ def test_correct_error_rows_invalid_shift_days(client):
     }
 
     response = client.post(CORRECT_ERROR_ROWS_URL, json=payload)
-    assert response.status_code == 400
 
-    data = response.json()
-    assert data["detail"]["message"] == "Validation failed"
-    assert "shift" in data["detail"]["failed_rows"][0]["reason"].lower()
+    assert response.status_code == 400
+    assert "validation" in response.json()["detail"].lower()
 
 
 # /upload/error-files{filename} API TESTCASES

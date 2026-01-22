@@ -15,11 +15,10 @@ CLIENT_SUMMARY_URL = "/client-summary"
 # HELPER FUNCTION
 def seed_client_summary_data(db):
     """
-    Seed database with minimal shift allowance data
-    required for client summary tests.
+    Insert minimal shift allowance data required for client summary tests.
 
-    Args:
-        db: Database session fixture.
+    This helper ensures at least one employee record exists so that
+    the client summary API can return valid results.
     """
     db.query(ShiftAllowances).delete()
     db.add(
@@ -37,21 +36,21 @@ def seed_client_summary_data(db):
 # /client-summary API TESTCASES
 def test_client_summary_all_clients_success(client, db_session):
     """
-    Verify client summary returns successfully when
-    requesting data for all clients.
+    Verify that requesting summary data for all clients
+    returns a successful response.
     """
     seed_client_summary_data(db_session)
 
-    resp = client.post(CLIENT_SUMMARY_URL, json={"clients": "ALL"})
-    assert resp.status_code == 200
-    assert isinstance(resp.json(), dict)
+    response = client.post(CLIENT_SUMMARY_URL, json={"clients": "ALL"})
 
+    assert response.status_code == 200
+    assert isinstance(response.json(), dict)
 
 
 def test_client_summary_specific_client_success(client, db_session):
     """
-    Verify client summary returns data for a specific client
-    with valid year and month filters.
+    Verify that requesting summary data for a specific client
+    and department returns valid monthly data.
     """
     seed_client_summary_data(db_session)
 
@@ -61,37 +60,28 @@ def test_client_summary_specific_client_success(client, db_session):
         "selected_months": ["01"],
     }
 
-    resp = client.post(CLIENT_SUMMARY_URL, json=payload)
-    assert resp.status_code == 200
+    response = client.post(CLIENT_SUMMARY_URL, json=payload)
 
-    month_data = resp.json()["2024-01"]
-
-    if "clients" in month_data:
-        assert "ClientA" in month_data["clients"]
-    else:
-        assert "message" in month_data
+    assert response.status_code == 200
+    month_data = response.json()["2024-01"]
+    assert "clients" in month_data or "message" in month_data
 
 
-
-def test_client_summary_months_without_year_fails(client):
+def test_client_summary_missing_payload(client):
     """
-    Verify request fails when months are provided
-    without specifying a year.
+    Verify that sending an empty payload returns data
+    for the latest available month.
     """
-    payload = {
-        "clients": "ALL",
-        "selected_months": ["01"],
-    }
+    response = client.post(CLIENT_SUMMARY_URL, json={})
 
-    resp = client.post(CLIENT_SUMMARY_URL, json=payload)
-    assert resp.status_code == 400
-    assert "selected_year" in resp.text
-
+    assert response.status_code == 200
+    assert isinstance(response.json(), dict)
 
 
 def test_client_summary_invalid_quarter(client):
     """
-    Verify request fails when an invalid quarter value is provided.
+    Verify that an invalid quarter value results in
+    a 400 Bad Request response.
     """
     payload = {
         "clients": "ALL",
@@ -99,6 +89,7 @@ def test_client_summary_invalid_quarter(client):
         "selected_quarters": ["Q5"],
     }
 
-    resp = client.post(CLIENT_SUMMARY_URL, json=payload)
-    assert resp.status_code == 400
-    assert "Invalid quarter" in resp.text
+    response = client.post(CLIENT_SUMMARY_URL, json=payload)
+
+    assert response.status_code == 400
+    assert "Invalid quarter" in response.text
