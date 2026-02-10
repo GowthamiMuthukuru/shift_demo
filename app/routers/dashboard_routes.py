@@ -11,7 +11,8 @@ from schemas.dashboardschema import (
     VerticalGraphResponse,
     PieChartClientShift,
     ClientList,
-    DashboardFilterRequest
+    DashboardFilterRequest,
+    ClientAnalyticsRequest
 )
 
 from services.dashboard_service import (
@@ -20,7 +21,7 @@ from services.dashboard_service import (
     get_vertical_bar_service,
     get_piechart_shift_summary,
     get_all_clients_service,
-    get_client_dashboard_summary
+    get_client_dashboard_summary,client_analytics_service
 )
 
 
@@ -80,11 +81,18 @@ def get_vertical_bar(
     return get_vertical_bar_service(db, start_month,
                                     end_month,top)
 
+
 @router.post("/client-allowance-summary")
 def client_dashboard_summary(
     payload: DashboardFilterRequest,
     db: Session = Depends(get_db),
-    _current_user = Depends(get_current_user)
+    _current_user=Depends(get_current_user),
 ):
-    """Return client allowance summary & account manager summary for dashboard."""
-    return get_client_dashboard_summary(db, payload)
+    # Force dict (Pydantic v2)
+    payload_dict = payload.model_dump(exclude_none=True)
+    return get_client_dashboard_summary(db, payload_dict)
+
+
+@router.post("/client-analytics")
+def client_analytics(payload: ClientAnalyticsRequest, db: Session = Depends(get_db)):
+    return client_analytics_service(db, payload.dict())

@@ -16,7 +16,7 @@ router = APIRouter(
 def fetch_employee_details(
     payload: dict = Body(..., example={
         "emp_id": "IN01804611",
-        "account_manager": "John Doe",
+        "client_partner": "John Doe",
         "clients": "ALL",
         "department": "Infra - IT Operations",
         "start_month": "YYYY-MM",
@@ -35,7 +35,7 @@ def fetch_employee_details(
 
     Filters supported:
     - Employee ID
-    - Account Manager
+    - client partner
     - Single Client (clients)
     - Optional Department (department)
     - Start and End Month
@@ -51,7 +51,7 @@ def fetch_employee_details(
     return export_filtered_excel(
         db=db,
         emp_id=payload.get("emp_id"),
-        account_manager=payload.get("account_manager"),
+        client_partner=payload.get("client_partner"),
         start_month=payload.get("start_month"),
         end_month=payload.get("end_month"),
         start=payload.get("start", 0),

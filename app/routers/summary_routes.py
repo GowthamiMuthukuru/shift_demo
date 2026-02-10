@@ -14,7 +14,7 @@ from utils.dependencies import get_current_user
 from services.summary_service import get_client_shift_summary
 from schemas.displayschema import ClientSummary
 
-router = APIRouter(prefix="/summary", tags=["Summary"])
+router = APIRouter(prefix="/summary")
 
 
 @router.get(

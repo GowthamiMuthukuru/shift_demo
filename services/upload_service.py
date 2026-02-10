@@ -4,22 +4,21 @@ import os
 import uuid
 import io
 import re
-import calendar
 from datetime import datetime, date
-from typing import List
-import json
-
+from decimal import Decimal
 import pandas as pd
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
-
-from models.models import UploadedFiles, ShiftAllowances, ShiftMapping, ShiftsAmount
+import calendar
 from schemas.displayschema import CorrectedRow
+from models.models import UploadedFiles, ShiftAllowances, ShiftMapping, ShiftsAmount
 from utils.enums import ExcelColumnMap
-
+from utils.shift_config import get_shift_string, get_all_shift_keys, get_allowance_columns
+from fastapi.responses import JSONResponse
 
 TEMP_FOLDER = "media/error_excels"
 os.makedirs(TEMP_FOLDER, exist_ok=True)
+
 
 MONTH_MAP = {
     "Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4,
@@ -28,8 +27,14 @@ MONTH_MAP = {
 }
 
 
+def format_inr(amount):
+    try:
+        amount = Decimal(amount)
+    except Exception:
+        return "₹ 0"
+    return f"₹ {amount:,.0f}"
+
 def make_json_safe(obj):
-    """Convert dates and nested objects into JSON-safe values."""
     if isinstance(obj, (datetime, date)):
         return obj.isoformat()
     if isinstance(obj, dict):
@@ -38,9 +43,8 @@ def make_json_safe(obj):
         return [make_json_safe(i) for i in obj]
     return obj
 
-
 def parse_month_format(value: str):
-    """Parse month in Mon'YY format and return a date."""
+    """Parse Mon'YY format to date object."""
     if not isinstance(value, str):
         return None
     try:
@@ -49,19 +53,17 @@ def parse_month_format(value: str):
     except Exception:
         return None
 
-
 def load_shift_rates(db: Session) -> dict:
-    """Load shift rates from DB and return a dictionary."""
-    rates = {}
-    for r in db.query(ShiftsAmount).all():
-        if r.shift_type:
-            rates[r.shift_type.upper()] = float(r.amount or 0)
-    return rates
-
+    """Load shift allowance rates from DB."""
+    return {
+        r.shift_type.upper(): float(r.amount or 0)
+        for r in db.query(ShiftsAmount).all()
+        if r.shift_type
+    }
 
 def delete_existing_emp_month(db, emp_id, client, duration_month, payroll_month):
-    """Delete existing shift allowance records for an employee in a month."""
-    existing = (
+    """Delete existing records for an employee and month before insert."""
+    records = (
         db.query(ShiftAllowances)
         .filter(
             ShiftAllowances.emp_id == emp_id,
@@ -72,68 +74,52 @@ def delete_existing_emp_month(db, emp_id, client, duration_month, payroll_month)
         .all()
     )
 
-    for rec in existing:
-        db.query(ShiftMapping).filter(
-            ShiftMapping.shiftallowance_id == rec.id
-        ).delete()
+    for rec in records:
+        db.query(ShiftMapping).filter(ShiftMapping.shiftallowance_id == rec.id).delete()
         db.delete(rec)
 
     db.flush()
 
-
 def validate_required_excel_columns(df: pd.DataFrame):
-    """Check if all required Excel columns are present."""
-    required_columns = {e.value for e in ExcelColumnMap}
-    uploaded_columns = set(df.columns)
-
-    missing = required_columns - uploaded_columns
-
+    """Ensure all required columns exist in uploaded Excel."""
+    required = {str(e.value) for e in ExcelColumnMap}
+    uploaded = {str(c) for c in df.columns}
+    missing = required - uploaded
     if missing:
         raise HTTPException(
             status_code=400,
-            detail={
-                "message": "Invalid Excel format",
-                "missing_columns": sorted(missing)
-            }
+            detail={"message": "Invalid Excel format", "missing_columns": sorted(missing)},
         )
 
-
 def validate_excel_data(df: pd.DataFrame):
-    """Validate Excel data for numeric fields, months, and totals."""
-    errors = []
-    error_rows = []
+    """Validate Excel data: numeric shifts, month formats, total days."""
+    errors, error_rows = [], []
+    month_pattern = re.compile(r"^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)'[0-9]{2}$")
 
-    month_pattern = re.compile(
-        r"^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)'[0-9]{2}$"
-    )
+    shift_keys = get_all_shift_keys()
 
     for idx, row in df.iterrows():
         row_errors = []
 
-        for col in [
-            "shift_a_days", "shift_b_days",
-            "shift_c_days", "prime_days", "total_days"
-        ]:
+       
+        for col in shift_keys + ["total_days"]:
             try:
-                df.at[idx, col] = float(row.get(col, 0))
+                df.at[idx, col] = float(row.get(col, 0) or 0)
                 if df.at[idx, col] < 0:
                     row_errors.append(f"Negative value in '{col}'")
             except Exception:
                 row_errors.append(f"Invalid numeric value in '{col}'")
 
+       
         for col in ["duration_month", "payroll_month"]:
             val = str(row.get(col, "")).strip()
             if val and not month_pattern.match(val):
                 row_errors.append(f"Invalid month format in '{col}'")
 
+       
         try:
-            total = (
-                df.at[idx, "shift_a_days"]
-                + df.at[idx, "shift_b_days"]
-                + df.at[idx, "shift_c_days"]
-                + df.at[idx, "prime_days"]
-            )
-            if total != df.at[idx, "total_days"]:
+            total = sum(float(row.get(c, 0) or 0) for c in shift_keys)
+            if abs(total - float(row.get("total_days", 0) or 0)) > 0.01:
                 row_errors.append("Total days do not match sum of shifts")
         except Exception:
             pass
@@ -144,50 +130,58 @@ def validate_excel_data(df: pd.DataFrame):
             error_rows.append(r)
             errors.append(idx)
 
-    clean_df = df.drop(index=errors).reset_index(drop=True)
-    error_df = pd.DataFrame(error_rows) if error_rows else None
-
-    return clean_df, error_df
-
+    return df.drop(index=errors).reset_index(drop=True), (
+        pd.DataFrame(error_rows) if error_rows else None
+    )
 
 def normalize_error_rows(error_rows):
-    """Convert error rows into JSON-friendly structure."""
+    """Normalize errors for JSON response."""
     normalized = []
-
     for row in error_rows:
         r = dict(row)
         err_text = r.pop("error", "")
         reason = {}
-
         for err in err_text.split(";"):
             err = err.strip()
-            if "Invalid numeric value" in err or "Negative value" in err:
-                col = err.split("'")[1]
-                reason[col] = "Expected non-negative numeric value"
-            elif "Invalid month format" in err:
-                if "duration_month" in err:
-                    reason["duration_month"] = "Expected Jan'25"
-                elif "payroll_month" in err:
-                    reason["payroll_month"] = "Expected Jan'25"
-            elif "Total days do not match" in err:
+            if "numeric" in err or "Negative" in err:
+                parts = err.split("'")
+                if len(parts) >= 2:
+                    reason[parts[1]] = "Expected non-negative numeric value"
+                else:
+                    reason["numeric"] = "Expected non-negative numeric value"
+            elif "month format" in err:
+                reason["month"] = "Expected Mon'YY format"
+            elif "Total days" in err:
                 reason["total_days"] = "Shift days mismatch"
-
         r["reason"] = reason
         normalized.append(r)
-
     return normalized
+
+def normalize_header(s: str) -> str:
+    """
+    Normalize Excel headers for robust matching:
+    - trim
+    - collapse multiple spaces
+    - replace dash variants with '-'
+    - lowercase
+    """
+    if s is None:
+        return ""
+    s = str(s).strip()
+    s = s.replace("–", "-").replace("—", "-").replace("−", "-")
+    s = re.sub(r"\s+", " ", s)
+    return s.lower()
 
 
 async def process_excel_upload(file, db: Session, user, base_url: str):
-    """Process uploaded Excel file and persist valid shift records."""
-
+    """Process uploaded Excel for shift allowances."""
     if not file.filename.endswith((".xls", ".xlsx")):
-        raise HTTPException(status_code=400, detail="Only Excel files allowed")
+        raise HTTPException(400, "Only Excel files allowed")
 
     uploaded_file = UploadedFiles(
         filename=file.filename,
         uploaded_by=user.id,
-        status="processing"
+        status="processing",
     )
     db.add(uploaded_file)
     db.commit()
@@ -195,33 +189,96 @@ async def process_excel_upload(file, db: Session, user, base_url: str):
 
     try:
         df = pd.read_excel(io.BytesIO(await file.read()))
-
         validate_required_excel_columns(df)
 
         df.rename(columns={e.value: e.name for e in ExcelColumnMap}, inplace=True)
         df = df.where(pd.notnull(df), 0)
 
         clean_df, error_df = validate_excel_data(df)
+        error_rows, fname = [], None
 
-        error_rows = []
-        fname = None
-
+    
         if error_df is not None and not error_df.empty:
-            error_rows = normalize_error_rows(error_df.to_dict(orient="records"))
+            error_rows = normalize_error_rows(error_df.to_dict("records"))
             fname = f"validation_errors_{uuid.uuid4().hex}.xlsx"
-            error_df.to_excel(os.path.join(TEMP_FOLDER, fname), index=False)
+            file_path = os.path.join(TEMP_FOLDER, fname)
 
-        if clean_df.empty:
-            raise HTTPException(
-                status_code=400,
-                detail=make_json_safe({
-                    "message": "File processed with errors",
-                    "records_inserted": 0,
-                    "skipped_records": len(error_rows),
-                    "error_file": fname,
-                    "error_rows": error_rows,
+            with pd.ExcelWriter(file_path, engine="xlsxwriter") as writer:
+                error_df.to_excel(writer, index=False, sheet_name="Errors")
+                workbook = writer.book
+                sheet = writer.sheets["Errors"]
+
+              
+                fmt_header = workbook.add_format({
+                    "align": "center", "valign": "vcenter",
+                    "bold": True, "border": 1, "text_wrap": True
                 })
-            )
+                fmt_center = workbook.add_format({
+                    "align": "center", "valign": "vcenter", "border": 1
+                })
+                fmt_days = workbook.add_format({
+                    "align": "center", "valign": "vcenter", "border": 1,
+                    "num_format": "0.0"   
+                })
+
+               
+                fmt_inr = workbook.add_format({
+                    "align": "center", "valign": "vcenter", "border": 1,
+                    "num_format": "₹ #,##0"
+                })
+
+                shift_keys = get_all_shift_keys()
+                DAY_COLS = set(shift_keys + ["total_days"])
+
+
+                configured_allowance_cols = get_allowance_columns()
+
+                normalized_allowance_cols = {normalize_header(c) for c in configured_allowance_cols}
+
+                CURRENCY_COLS = {
+                    col for col in error_df.columns
+                    if normalize_header(col) in normalized_allowance_cols
+                }
+                CURRENCY_COLS = CURRENCY_COLS - DAY_COLS
+
+                for c, col in enumerate(error_df.columns):
+
+                    header = get_shift_string(col) if col in shift_keys else col
+                    header = header or col
+                    sheet.write(0, c, header, fmt_header)
+                    sheet.set_column(c, c, 25)
+
+                for r, row in enumerate(error_df.itertuples(index=False), start=1):
+                    for c, val in enumerate(row):
+                        col_name = error_df.columns[c]
+
+                        if col_name in DAY_COLS:
+                           
+                            try:
+                                sheet.write_number(r, c, float(val or 0), fmt_days)
+                            except Exception:
+                                sheet.write(r, c, "" if val is None else str(val), fmt_center)
+
+                        elif col_name in CURRENCY_COLS:
+                           
+                            try:
+                                sheet.write_number(r, c, float(val or 0), fmt_inr)
+                            except Exception:
+                                sheet.write(r, c, "" if val is None else str(val), fmt_center)
+
+                        else:
+                        
+                            sheet.write(r, c, "" if val is None else str(val), fmt_center)
+
+       
+        if clean_df.empty:
+            raise HTTPException(400, make_json_safe({
+                "message": "File processed with errors",
+                "records_inserted": 0,
+                "skipped_records": len(error_rows),
+                "error_file": fname,
+                "error_rows": error_rows,
+            }))
 
         clean_df["duration_month"] = clean_df["duration_month"].apply(parse_month_format)
         clean_df["payroll_month"] = clean_df["payroll_month"].apply(parse_month_format)
@@ -232,87 +289,67 @@ async def process_excel_upload(file, db: Session, user, base_url: str):
         allowed_fields = {
             "emp_id", "emp_name", "grade", "department",
             "client", "project", "project_code",
-            "account_manager", "practice_lead", "delivery_manager",
+            "client_partner", "practice_lead", "delivery_manager",
             "duration_month", "payroll_month",
             "billability_status", "practice_remarks", "rmg_comments",
         }
 
-        for row in clean_df.to_dict(orient="records"):
-
-            delete_existing_emp_month(db,
-                                      row.get("emp_id"),
-                                      row.get("client"),
-                                      row.get("duration_month"),
-                                      row.get("payroll_month"),
-        )
+        shift_keys = get_all_shift_keys()
+        for row in clean_df.to_dict("records"):
+            delete_existing_emp_month(
+                db, row.get("emp_id"), row.get("client"),
+                row.get("duration_month"), row.get("payroll_month")
+            )
 
             sa = ShiftAllowances(**{k: row[k] for k in allowed_fields if k in row})
             db.add(sa)
             db.flush()
 
-            for shift, col in [
-                ("A", "shift_a_days"),
-                ("B", "shift_b_days"),
-                ("C", "shift_c_days"),
-                ("PRIME", "prime_days"),
-            ]:
-                days = float(row.get(col, 0) or 0)
+            for shift in shift_keys:
+                days = float(row.get(shift, 0) or 0)
                 if days > 0:
-                    rate = shift_rates.get(shift, 0)
-                    db.add(
-                        ShiftMapping(
-                            shiftallowance_id=sa.id,
-                            shift_type=shift,
-                            days=days,
-                            total_allowance=days * rate
-                        )
-                    )
+                    db.add(ShiftMapping(
+                        shiftallowance_id=sa.id,
+                        shift_type=shift,
+                        days=days,
+                        total_allowance=days * shift_rates.get(shift, 0),
+                    ))
 
             inserted += 1
 
         db.commit()
 
         if error_rows:
-            raise HTTPException(
-                status_code=400,
-                detail=make_json_safe({
-                    "message": "File processed with errors",
-                    "records_inserted": inserted,
-                    "skipped_records": len(error_rows),
-                    "error_file": fname,
-                    "error_rows": error_rows,
-                })
-            )
+            raise HTTPException(400, make_json_safe({
+                "message": "File processed with errors",
+                "records_inserted": inserted,
+                "skipped_records": len(error_rows),
+                "error_file": fname,
+                "error_rows": error_rows,
+            }))
 
-        return {
-            "message": "File processed successfully",
-            "records_inserted": inserted
-        }
+        return {"message": "File processed successfully", "records_inserted": inserted}
 
     except HTTPException:
         db.rollback()
         raise
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=str(e)) from e
-
+        raise HTTPException(500, str(e)) from e
 
 def parse_yyyy_mm(value: str) -> date:
-    """Parse month in Mon'YY format (e.g. Jan'25) and return first day of month."""
+    """Parse month in Mon'YY format (e.g., Jan'25)."""
     if not value:
         raise HTTPException(
             status_code=400,
-            detail="Month is required in Mon'YY format (e.g. Jan'25)"
+            detail="Month is required in Mon'YY format (e.g., Jan'25)"
         )
-
     value = value.strip()
-
     if not re.match(r"^[A-Za-z]{3}'\d{2}$", value):
         raise HTTPException(
             status_code=400,
-            detail="Invalid month format. Expected Mon'YY (e.g. Jan'25)"
+            detail="Invalid month format. Expected Mon'YY (e.g., Jan'25)"
         )
-
     try:
         return datetime.strptime(value, "%b'%y").date().replace(day=1)
     except ValueError as exc:
@@ -321,73 +358,32 @@ def parse_yyyy_mm(value: str) -> date:
             detail="Invalid month value"
         ) from exc
 
-
-def validate_not_future_month(month_date: date, field_name: str):
-    """Ensure the month is not in the future."""
-    today = date.today().replace(day=1)
-    if month_date > today:
-        raise HTTPException(
-            status_code=400,
-            detail=f"{field_name} cannot be a future month"
-        )
-
-
 def validate_half_day(value: float, field_name: str):
     """Ensure value is non-negative and in 0.5 increments."""
     if value < 0:
-        raise HTTPException(
-            status_code=400,
-            detail=f"{field_name} must be non-negative"
-        )
-
+        raise HTTPException(status_code=400, detail=f"{field_name} must be non-negative")
     if (value * 2) % 1 != 0:
-        raise HTTPException(
-            status_code=400,
-            detail=f"{field_name} must be in 0.5 increments (e.g. 1, 1.5, 7.5)"
-        )
-
-
-def validate_shift_days(row: CorrectedRow) -> float:
-    """Validate shifts for a row and return total shift days."""
-    shifts = {
-        "shift_a_days": row.shift_a_days or 0,
-        "shift_b_days": row.shift_b_days or 0,
-        "shift_c_days": row.shift_c_days or 0,
-        "prime_days": row.prime_days or 0,
-    }
-
-    total = 0.0
-
-    for name, value in shifts.items():
-        try:
-            value = float(value)
-        except ValueError as exc:
-            raise HTTPException(
-                status_code=400,
-                detail=f"{name} must be numeric"
-            ) from exc
-
-        validate_half_day(value, name)
-        total += value
-
-    if total <= 0:
-        raise HTTPException(
-            status_code=400,
-            detail="At least one shift day must be greater than 0"
-        )
-
-    return total
-
+        raise HTTPException(status_code=400, detail=f"{field_name} must be in 0.5 increments")
 
 def days_in_month(month_date: date) -> int:
-    """Return the number of days in the given month."""
     return calendar.monthrange(month_date.year, month_date.month)[1]
 
+def load_shift_rates(db: Session) -> dict:
+    """Load shift allowance rates from DB."""
+    return {
+        r.shift_type.upper(): float(r.amount or 0)
+        for r in db.query(ShiftsAmount).all()
+        if r.shift_type
+    }
 
-def update_corrected_rows(db: Session, corrected_rows: List["CorrectedRow"]):
-    """Insert or update corrected shift allowance rows."""
+def update_corrected_rows(db: Session, corrected_rows: list[CorrectedRow]):
+    """Update corrected rows for shift allowances using dynamic shift config."""
     if not corrected_rows:
         raise HTTPException(400, "No corrected rows provided")
+
+    
+    shift_keys = [k.upper().strip() for k in get_all_shift_keys()]
+    valid_shift_set = set(shift_keys)
 
     shift_rates = load_shift_rates(db)
     failed_rows = []
@@ -396,19 +392,48 @@ def update_corrected_rows(db: Session, corrected_rows: List["CorrectedRow"]):
         try:
             duration_month = parse_yyyy_mm(row.duration_month)
             payroll_month = parse_yyyy_mm(row.payroll_month)
+            today_month = date.today().replace(day=1)
 
-            total_shift_days = validate_shift_days(row)
+            if duration_month > today_month:
+                raise HTTPException(400, "Duration month cannot be a future month")
+            if payroll_month > today_month:
+                raise HTTPException(400, "Payroll month cannot be a future month")
+            if duration_month == payroll_month:
+                raise HTTPException(400, "Duration month and payroll month cannot be the same")
+            if payroll_month < duration_month:
+                raise HTTPException(400, "Payroll month must be after duration month")
+
+        
+            dynamic = row.shift_days or {}
+            shifts = {str(k).upper().strip(): float(v or 0) for k, v in dynamic.items()}
+
+            
+            if not shifts:
+                shifts = {k: float(getattr(row, k, 0) or 0) for k in shift_keys}
+
+           
+            unknown = [k for k in shifts.keys() if k not in valid_shift_set]
+            if unknown:
+                raise HTTPException(400, f"Invalid shift types: {unknown}")
+
+            shifts = {k: float(shifts.get(k, 0) or 0) for k in shift_keys}
+
+            total_shift_days = 0.0
+            for shift_name, value in shifts.items():
+                validate_half_day(value, shift_name)
+                total_shift_days += value
+
+            if total_shift_days <= 0:
+                raise HTTPException(400, "At least one shift day must be greater than 0")
             if total_shift_days > days_in_month(duration_month):
-                raise HTTPException(
-                    400,
-                    "Total shift days exceed number of days in duration month"
-                )
+                raise HTTPException(400, "Total shift days exceed days in duration month")
+
 
             sa = (
                 db.query(ShiftAllowances)
                 .filter(
                     ShiftAllowances.emp_id == row.emp_id,
-                    ShiftAllowances.client == row.client,
+                    ShiftAllowances.client == getattr(row, "client", None),
                     ShiftAllowances.duration_month == duration_month,
                     ShiftAllowances.payroll_month == payroll_month,
                 )
@@ -418,58 +443,35 @@ def update_corrected_rows(db: Session, corrected_rows: List["CorrectedRow"]):
             if not sa:
                 sa = ShiftAllowances(
                     emp_id=row.emp_id,
-                    client=row.client,
+                    client=getattr(row, "client", None),
                     duration_month=duration_month,
                     payroll_month=payroll_month,
                 )
                 db.add(sa)
                 db.flush()
 
-            sa.emp_name = row.emp_name
-            sa.grade = row.grade
-            sa.current_status = row.current_status
-            sa.department = row.department
-            sa.project = row.project
-            sa.project_code = row.project_code
-            sa.account_manager = row.account_manager
-            sa.practice_lead = row.practice_lead
-            sa.delivery_manager = row.delivery_manager
-            sa.shift_types = row.shift_types
-            sa.total_days = row.total_days
-            sa.timesheet_billable_days = row.timesheet_billable_days
-            sa.timesheet_non_billable_days = row.timesheet_non_billable_days
-            sa.diff = row.diff
-            sa.final_total_days = row.final_total_days
-            sa.billability_status = row.billability_status
-            sa.practice_remarks = row.practice_remarks
-            sa.rmg_comments = row.rmg_comments
-            sa.amar_approval = row.amar_approval
-            sa.shift_a_allowances = row.shift_a_allowances
-            sa.shift_b_allowances = row.shift_b_allowances
-            sa.shift_c_allowances = row.shift_c_allowances
-            sa.prime_allowances = row.prime_allowances
-            sa.total_days_allowances = row.total_days_allowances
-            sa.am_email_attempt = row.am_email_attempt
-            sa.am_approval_status = row.am_approval_status
+            for attr in [
+                "emp_name", "grade", "department", "project", "project_code",
+                "client_partner", "practice_lead", "delivery_manager",
+                "current_status", "total_days", "timesheet_billable_days",
+                "timesheet_non_billable_days", "diff", "final_total_days",
+                "billability_status", "practice_remarks", "rmg_comments",
+                "amar_approval"
+            ]:
+                if hasattr(row, attr):
+                    setattr(sa, attr, getattr(row, attr))
 
-            db.query(ShiftMapping).filter(
-                ShiftMapping.shiftallowance_id == sa.id
-            ).delete()
+          
+            db.query(ShiftMapping).filter(ShiftMapping.shiftallowance_id == sa.id).delete()
 
-            for shift, days in {
-                "A": row.shift_a_days,
-                "B": row.shift_b_days,
-                "C": row.shift_c_days,
-                "PRIME": row.prime_days,
-            }.items():
-                if days and float(days) > 0:
-                    rate = shift_rates.get(shift, 0)
+            for shift_name, days in shifts.items():
+                if days > 0:
                     db.add(
                         ShiftMapping(
                             shiftallowance_id=sa.id,
-                            shift_type=shift,
-                            days=float(days),
-                            total_allowance=float(days) * rate,
+                            shift_type=shift_name,
+                            days=days,
+                            total_allowance=days * shift_rates.get(shift_name, 0),
                         )
                     )
 
@@ -477,22 +479,21 @@ def update_corrected_rows(db: Session, corrected_rows: List["CorrectedRow"]):
 
         except Exception as e:
             db.rollback()
-            reason = e.detail if isinstance(e, HTTPException) else str(e)
             failed_rows.append({
                 "emp_id": row.emp_id,
-                "client": row.client,
-                "duration_month": row.duration_month,
-                "payroll_month": row.payroll_month,
-                "reason": reason,
+                "project": getattr(row, "project", ""),
+                "duration_month": getattr(row, "duration_month", ""),
+                "payroll_month": getattr(row, "payroll_month", ""),
+                "reason": e.detail if isinstance(e, HTTPException) else str(e),
             })
 
     if failed_rows:
-        raise HTTPException(
-            400,
-            json.dumps({
+        return JSONResponse(
+            status_code=400,
+            content={
                 "message": "Validation failed",
                 "failed_rows": failed_rows
-            }, default=str)
+            }
         )
 
     return {

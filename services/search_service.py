@@ -18,12 +18,14 @@ Client filtering supports single client with optional department:
 
 import re
 from datetime import datetime, date
+
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
 from sqlalchemy import func, and_, extract
 
 from models.models import ShiftAllowances, ShiftMapping, ShiftsAmount
 from utils.client_enums import Company
+from utils.shift_config import get_all_shift_keys, get_allowance_columns
 
 
 def validate_year(year: str):
@@ -71,16 +73,12 @@ def apply_client_department_filters(query, client=None, department=None):
     if client and client.strip().upper() != "ALL":
         client_norm = normalize_company_name(client)
         conditions.append(
-            func.upper(ShiftAllowances.client).like(
-                f"%{client_norm.strip().upper()}%"
-            )
+            func.upper(ShiftAllowances.client).like(f"%{client_norm.strip().upper()}%")
         )
 
     if department:
         conditions.append(
-            func.upper(ShiftAllowances.department).like(
-                f"%{department.strip().upper()}%"
-            )
+            func.upper(ShiftAllowances.department).like(f"%{department.strip().upper()}%")
         )
 
     if conditions:
@@ -117,55 +115,76 @@ def get_default_start_month(db: Session) -> str:
     raise HTTPException(404, "No data found in the last 12 months")
 
 
-def aggregate_shift_details(db, rows, rates, labels):
-    """Aggregate shift allowance amounts by shift type."""
-    overall = {v: 0.0 for v in labels.values()}
+
+def aggregate_shift_details(db, rows, rates):
+    """
+    Aggregate shift allowance amounts by SHIFT KEY only:
+    PST_MST, US_INDIA, SG, ANZ 
+    """
+  
+    overall = {k: 0.0 for k in get_all_shift_keys()}
+
     total = 0.0
     for row in rows:
         mappings = db.query(ShiftMapping).filter(
             ShiftMapping.shiftallowance_id == row.id
         ).all()
+
         for m in mappings:
             days = float(m.days or 0)
             if days <= 0:
                 continue
-            rate = rates.get(m.shift_type.upper(), 0)
+
+            shift_key = (m.shift_type or "").upper().strip()
+            rate = float(rates.get(shift_key, 0.0))
+
             amount = days * rate
-            label = labels.get(m.shift_type.upper(), m.shift_type)
-            overall[label] += amount
+
+            overall.setdefault(shift_key, 0.0)
+            overall[shift_key] += amount
             total += amount
+
     return overall, total
 
 
-def prepare_employee_data(db, rows, rates, labels):
-    """Prepare employee-wise shift and allowance details."""
+def prepare_employee_data(db, rows, rates):
+    """
+    Prepare employee-wise shift and allowance details using SHIFT KEY only.
+    """
     employees = []
     for row in rows:
         rec = row._asdict()
         shift_id = rec.pop("id")
-        emp_shift = {}
+
+        emp_shift_days = {}
         total = 0.0
+
         mappings = db.query(ShiftMapping).filter(
             ShiftMapping.shiftallowance_id == shift_id
         ).all()
+
         for m in mappings:
             days = float(m.days or 0)
             if days <= 0:
                 continue
-            rate = rates.get(m.shift_type.upper(), 0)
+
+            shift_key = (m.shift_type or "").upper().strip()
+            rate = float(rates.get(shift_key, 0.0))
             total += days * rate
-            label = labels.get(m.shift_type.upper(), m.shift_type)
-            emp_shift[label] = emp_shift.get(label, 0) + days
-        rec["shift_details"] = {k: int(v) for k, v in emp_shift.items()}
+
+            emp_shift_days[shift_key] = emp_shift_days.get(shift_key, 0.0) + days
+
+        rec["shift_details"] = {k: int(v) for k, v in emp_shift_days.items()}
         rec["total_allowance"] = round(total, 2)
         employees.append(rec)
+
     return employees
 
 
 def export_filtered_excel(
     db: Session,
     emp_id=None,
-    account_manager=None,
+    client_partner=None,
     start_month=None,
     end_month=None,
     start=0,
@@ -176,35 +195,36 @@ def export_filtered_excel(
     selected_months=None,
     selected_quarters=None,
 ):
-    """Export shift allowances filtered by month, year, quarter, client, or dept."""
+    """Export shift allowances filtered by month, year, quarter, client, dept, or client partner."""
     today = date.today()
     allowed_months = set()
     year = None
 
     if selected_year:
         year = validate_year(selected_year)
+
         if selected_months:
             for m in selected_months:
                 month_int = validate_month(m)
                 if year == today.year and month_int > today.month:
-                    raise HTTPException(
-                        400, f"Future month {month_int:02d} is not allowed"
-                    )
+                    raise HTTPException(400, f"Future month {month_int:02d} is not allowed")
                 allowed_months.add(month_int)
+
         if selected_quarters:
             validate_quarters(selected_quarters)
             for q in selected_quarters:
                 q_months = get_quarter_months(q.upper())
+
                 if not any(
                     year < today.year or (year == today.year and m <= today.month)
                     for m in q_months
                 ):
-                    raise HTTPException(
-                        400, f"{q.upper()} has not started yet and cannot be selected"
-                    )
+                    raise HTTPException(400, f"{q.upper()} has not started yet and cannot be selected")
+
                 for m in q_months:
                     if year < today.year or (year == today.year and m <= today.month):
                         allowed_months.add(m)
+
         if allowed_months:
             start_month = f"{year}-{min(allowed_months):02d}"
             end_month = f"{year}-{max(allowed_months):02d}"
@@ -221,6 +241,7 @@ def export_filtered_excel(
 
     start_dt = datetime.strptime(start_month, "%Y-%m")
     end_dt = datetime.strptime(end_month, "%Y-%m")
+
     if end_dt.date() > date(today.year, today.month, 1):
         raise HTTPException(400, "Future months are not allowed in date range")
 
@@ -231,7 +252,7 @@ def export_filtered_excel(
         ShiftAllowances.department,
         ShiftAllowances.client,
         ShiftAllowances.project,
-        ShiftAllowances.account_manager,
+        ShiftAllowances.client_partner,
         func.to_char(ShiftAllowances.duration_month, "YYYY-MM").label("duration_month"),
         func.to_char(ShiftAllowances.payroll_month, "YYYY-MM").label("payroll_month"),
     )
@@ -249,8 +270,11 @@ def export_filtered_excel(
 
     if emp_id:
         base = base.filter(func.upper(ShiftAllowances.emp_id).like(f"%{emp_id.upper()}%"))
-    if account_manager:
-        base = base.filter(func.upper(ShiftAllowances.account_manager).like(f"%{account_manager.upper()}%"))
+
+    if client_partner:
+        base = base.filter(
+            func.upper(ShiftAllowances.client_partner).like(f"%{client_partner.upper()}%")
+        )
 
     base = apply_client_department_filters(base, clients, department)
 
@@ -265,9 +289,7 @@ def export_filtered_excel(
         expected_months = {f"{year}-{m:02d}" for m in sorted(allowed_months)}
         available_months = {r.duration_month for r in all_rows}
         if available_months != expected_months:
-            raise HTTPException(
-                404, "No data found for the selected quarter period"
-            )
+            raise HTTPException(404, "No data found for the selected quarter period")
 
     if not all_rows:
         raise HTTPException(404, "No data found for the selected period")
@@ -275,24 +297,24 @@ def export_filtered_excel(
     total_records = len(all_rows)
     headcount = len({r.emp_id for r in all_rows})
 
-    labels = {
-        "A": "A(9PM to 6AM)",
-        "B": "B(4PM to 1AM)",
-        "C": "C(6AM to 3PM)",
-        "PRIME": "PRIME(12AM to 9AM)",
+    rates = {
+        (r.shift_type or "").upper().strip(): float(r.amount or 0)
+        for r in db.query(ShiftsAmount).all()
     }
 
-    rates = {r.shift_type.upper(): float(r.amount or 0) for r in db.query(ShiftsAmount).all()}
-
-    overall_shift, overall_total = aggregate_shift_details(db, all_rows, rates, labels)
+    overall_shift, overall_total = aggregate_shift_details(db, all_rows, rates)
 
     paginated_rows = all_rows[start:start + limit]
-    employees = prepare_employee_data(db, paginated_rows, rates, labels)
+    employees = prepare_employee_data(db, paginated_rows, rates)
+
+    _ = get_allowance_columns()
 
     return {
         "total_records": total_records,
-        "shift_details": {**{k: v for k, v in overall_shift.items() if v > 0},
-                          "headcount": headcount,
-                          "total_allowance": round(overall_total, 2)},
+        "shift_details": {
+            **{k: v for k, v in overall_shift.items() if v > 0},
+            "headcount": headcount,
+            "total_allowance": round(overall_total, 2),
+        },
         "data": {"employees": employees},
     }

@@ -21,7 +21,7 @@ router = APIRouter(
     summary="Get client summary",
     description=(
         "Returns client summary based on filters like clients, "
-        "date range, employee, and account manager."
+        "date range, employee, and client partner."
     ),
 )
 def client_summary(
@@ -29,7 +29,7 @@ def client_summary(
         default={},
         example={
             "emp_id": ["IN01804611"],
-            "account_manager": ["John Doe"],
+            "client_partner": ["John Doe"],
             "clients": "ALL",
             "selected_year": "YYYY",
             "selected_months": ["01", "02"],

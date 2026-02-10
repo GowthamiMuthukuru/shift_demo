@@ -7,8 +7,8 @@ filter payloads. These schemas standardize request validation and
 response structures for analytics endpoints.
 """
 
-from typing import List,Optional, Literal,Union,Dict
-from pydantic import BaseModel,Field,field_validator
+from typing import List,Optional, Literal,Union,Dict,Any
+from pydantic import BaseModel,Field,field_validator,ConfigDict
 
 
 class PieChartClientShift(BaseModel):
@@ -61,41 +61,69 @@ class ClientList(BaseModel):
     """
     clients: List[str]
 
+SortBy = Literal["client", "client_partner", "departments", "headcount", "total_allowance"]
+SortOrder = Literal["default", "asc", "desc"]
 
 
 class DashboardFilterRequest(BaseModel):
     """
-    Dashboard filter request payload.
-
-    Supports client-wise filtering, date-based filtering (month, quarter,
-    year), and result limiting using the `top` parameter.
+    Pydantic v2 model.
     """
+    model_config = ConfigDict(extra="forbid")
 
-    clients: Union[
-        Literal["ALL"],
-        Dict[str, List[str]]
-    ]
+    clients: Union[Literal["ALL"], str, List[str]] = "ALL"
+    departments: Union[Literal["ALL"], str, List[str]] = "ALL"
 
+    years: Optional[List[int]] = None
+    months: Optional[List[int]] = None
 
-    top: str = Field(
-        default="ALL",
-        description="ALL or a numeric string like '2', '5', '10'"
-    )
+    headcounts: Union[Literal["ALL"], str, List[str]] = "ALL"
+    shifts: Union[Literal["ALL"], str, List[str]] = "ALL"
 
-    start_month: Optional[str] = None
-    end_month: Optional[str] = None
+    top: str = Field(default="ALL")
 
-    selected_year: Optional[int] = None
-    selected_months: Optional[List[str]] = None
-    selected_quarters: Optional[List[Literal["Q1","Q2","Q3","Q4"]]] = None
+    sort_by: Optional[SortBy] = "total_allowance"
+    sort_order: SortOrder = "default"
 
     @field_validator("top")
-    def validate_top(cls, v): # pylint: disable=no-self-argument
-        """
-        Validate the `top` field to allow only 'ALL' or a positive number string.
-        """
+    def validate_top(cls, v: str):
         if v == "ALL":
             return v
         if not v.isdigit() or int(v) <= 0:
-            raise ValueError("top must be 'ALL' or a positive number as string")
+            raise ValueError("top must be 'ALL' or positive number string")
         return v
+
+    @field_validator("headcounts")
+    def normalize_headcounts(cls, v):
+        if v == "ALL":
+            return v
+        if isinstance(v, str):
+            v = [v]
+        normalized = [str(x).strip() for x in v if str(x).strip()]
+        return normalized or "ALL"
+
+    @field_validator("shifts")
+    def normalize_shifts(cls, v):
+        if v == "ALL":
+            return v
+        if isinstance(v, str):
+            v = [v]
+        normalized = [str(x).strip().upper() for x in v if str(x).strip()]
+        return normalized or "ALL"
+
+
+class ClientAnalyticsRequest(BaseModel):
+    clients: Union[Literal["ALL"], str, List[str]] = "ALL"
+    departments: Union[Literal["ALL"], str, List[str]] = "ALL"
+    years: List[int] = Field(default_factory=lambda: [0])
+    months: List[int] = Field(default_factory=lambda: [0])
+    headcounts: Union[Literal["ALL"], str, List[str]] = "ALL"
+    shifts: Union[Literal["ALL"], str, List[str]] = "ALL"
+    top: Union[Literal["ALL"], str, int] = "ALL"
+
+    #  only two fields for sorting
+    sort_by: Optional[SortBy] = "total_allowance"
+    sort_order: SortOrder = "default"   # default means keep DB order
+
+    class Config:
+        extra = "forbid"
