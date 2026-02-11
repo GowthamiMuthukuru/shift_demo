@@ -10,7 +10,7 @@ from utils.client_enums import Company
 from utils.shift_config import get_all_shift_keys, get_shift_string
 
 from datetime import datetime, date
-from typing import Optional, Dict, Union, Any
+from typing import Optional, Dict, Union, Any,List
 from io import BytesIO
 from calendar import monthrange
 from diskcache import Cache
@@ -149,6 +149,7 @@ def fetch_shift_data(db: Session, start: int, limit: int):
 
     return selected_month, total_records, result, message
 
+
 def parse_shift_value(value: Any) -> float:
     """Parse and validate shift day input as a non-negative float."""
     if value is None or str(value).strip() == "":
@@ -175,11 +176,9 @@ def validate_half_day(value: float, field_name: str):
     """Ensure shift values are in 0.5-day increments."""
     if value is None:
         return
-
     if value < 0:
         raise HTTPException(status_code=400, detail=f"{field_name} must be non-negative")
-
-    
+    # value must be a multiple of 0.5
     if (value * 2) % 1 != 0:
         raise HTTPException(
             status_code=400,
@@ -194,35 +193,37 @@ def validate_not_future_month(month_date: date, field_name: str):
         raise HTTPException(status_code=400, detail=f"{field_name} cannot be a future month")
 
 
+def _load_shift_rates(db: Session) -> Dict[str, float]:
+    """
+    Load rates from ShiftsAmount once and map to UPPER shift keys.
+    """
+    rows = db.query(ShiftsAmount.shift_type, ShiftsAmount.amount).all()
+    return {(stype or "").upper().strip(): float(amount or 0.0) for stype, amount in rows}
+
 
 def update_shift_service(
     db: Session,
     emp_id: str,
     payroll_month: str,
-    updates: Dict[str, Union[int, float, str]],  
-    duration_month: Optional[str] = None
+    updates: Dict[str, Union[int, float, str]],  # {"PST_MST": 2, "ANZ": 1.5}
+    duration_month: Optional[str] = None,
 ):
     """
     Update shift days for an employee and recalculate allowances.
 
-     Now accepts dynamic shift keys from config:
+    Accepts dynamic shift keys from config:
         updates = {"PST_MST": 2, "ANZ": 1.5}
 
-    Typically called using request payload:
-        { "shifts": { ... } }
-      -> updates = payload.shifts
+    Typical payload shape:
+        { "shifts": { ... } }  -> updates = payload["shifts"]
     """
 
- 
     valid_keys = {k.upper().strip() for k in get_all_shift_keys()}
-
-  
-    incoming_keys = [(k or "").upper().strip() for k in updates.keys()]
     unknown = [orig for orig in updates.keys() if (orig or "").upper().strip() not in valid_keys]
     if unknown:
         raise HTTPException(status_code=400, detail=f"Invalid shift types: {unknown}")
 
-   
+  
     parsed: Dict[str, float] = {}
     for k, v in updates.items():
         key = (k or "").upper().strip()
@@ -230,6 +231,7 @@ def update_shift_service(
         validate_half_day(val, key)
         parsed[key] = float(val)
 
+  
     try:
         payroll_dt = datetime.strptime(payroll_month, "%Y-%m").date().replace(day=1)
     except Exception as exc:
@@ -252,6 +254,7 @@ def update_shift_service(
     if payroll_dt < duration_dt:
         raise HTTPException(status_code=400, detail="Payroll month cannot be earlier than duration month")
 
+
     max_days_in_month = monthrange(duration_dt.year, duration_dt.month)[1]
     if sum(parsed.values()) > max_days_in_month:
         raise HTTPException(
@@ -259,17 +262,16 @@ def update_shift_service(
             detail=(
                 f"Total days ({sum(parsed.values())}) cannot exceed "
                 f"{max_days_in_month} days of duration month."
-            )
+            ),
         )
 
-   
     rec = (
         db.query(ShiftAllowances)
         .options(joinedload(ShiftAllowances.shift_mappings))
         .filter(
             ShiftAllowances.emp_id == emp_id,
             extract("year", ShiftAllowances.duration_month) == duration_dt.year,
-            extract("month", ShiftAllowances.duration_month) == duration_dt.month
+            extract("month", ShiftAllowances.duration_month) == duration_dt.month,
         )
         .first()
     )
@@ -277,6 +279,7 @@ def update_shift_service(
         raise HTTPException(status_code=404, detail=f"No shift record found for employee {emp_id}")
 
     rates = _load_shift_rates(db)
+
 
     existing = {(m.shift_type or "").upper().strip(): m for m in (rec.shift_mappings or [])}
 
@@ -289,7 +292,7 @@ def update_shift_service(
                 shiftallowance_id=rec.id,
                 shift_type=stype,
                 days=days,
-                total_allowance=0.0
+                total_allowance=0.0,
             )
             db.add(mapping)
             existing[stype] = mapping
@@ -301,10 +304,9 @@ def update_shift_service(
     db.commit()
     db.refresh(rec)
 
- 
     total_days = 0.0
     total_allowance = 0.0
-    details = []
+    details: List[Dict[str, Union[str, float]]] = []
 
     for m in rec.shift_mappings or []:
         days = float(m.days or 0.0)
@@ -316,7 +318,7 @@ def update_shift_service(
                 detail=(
                     f"Total assigned days ({total_days}) exceed "
                     f"the duration month limit ({max_days_in_month})."
-                )
+                ),
             )
 
         stype = (m.shift_type or "").upper().strip()
@@ -324,26 +326,23 @@ def update_shift_service(
         m.total_allowance = float(days) * rate
         total_allowance += m.total_allowance
 
-        details.append({
-            "shift": stype,
-            "days": days,
-            "total": float(m.total_allowance)
-        })
+        details.append(
+            {
+                "shift": stype,
+                "days": days,
+                "total": float(m.total_allowance),
+            }
+        )
 
     db.commit()
-
-   
-    if is_latest_month(db, duration_dt):
-        cache.pop(LATEST_MONTH_KEY, None)
 
     return {
         "message": "Shift updated successfully",
         "updated_fields": list(parsed.keys()),
         "total_days": float(total_days),
         "total_allowance": float(total_allowance),
-        "shift_details": details
+        "shift_details": details,
     }
-
 
 def fetch_shift_record(emp_id: str, duration_month: str, payroll_month: str, db: Session):
     """Fetch a single employee shift record with allowance breakdown (dynamic shift keys)."""

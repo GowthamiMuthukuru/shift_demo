@@ -1,6 +1,6 @@
 """
 Service for exporting filtered shift allowance data as an Excel download (fast)
-WITH file-path caching (same technique as client summary download service).
+WITH file-path caching (simple, default-latest only).
 
 - Uses Pandas + XlsxWriter for speed on large datasets.
 - Excel headers use config display strings (with '\n') and are wrapped in Excel.
@@ -12,6 +12,7 @@ WITH file-path caching (same technique as client summary download service).
 from __future__ import annotations
 
 import os
+import tempfile
 from typing import Optional, Dict, List, Tuple, Any
 from datetime import datetime
 
@@ -26,15 +27,13 @@ from fastapi.responses import FileResponse
 from models.models import ShiftAllowances, ShiftMapping, ShiftsAmount
 from utils.shift_config import get_shift_string, get_all_shift_keys
 
-
 cache = Cache("./diskcache/latest_month")
 
 EXPORT_DIR = "exports"
 DEFAULT_EXPORT_FILE = "shift_data_latest.xlsx"
 
 LATEST_MONTH_KEY = "shift_data:latest_month"
-CACHE_TTL = 20 * 60 * 60  
-
+CACHE_TTL = 24 * 60 * 60  
 
 def is_default_latest_month_request(
     emp_id: Optional[str] = None,
@@ -60,6 +59,14 @@ def invalidate_shift_excel_cache() -> None:
     cache.pop(f"{LATEST_MONTH_KEY}:excel", None)
 
 
+def _get_db_latest_ym(db: Session) -> Optional[str]:
+    """
+    Return latest month available in DB as 'YYYY-MM', or None if table is empty.
+    """
+    latest_dt = db.query(func.max(func.date_trunc("month", ShiftAllowances.duration_month))).scalar()
+    return latest_dt.strftime("%Y-%m") if latest_dt else None
+
+
 def _parse_month(month: str, field_name: str) -> datetime:
     """Convert YYYY-MM to datetime at first day of month."""
     try:
@@ -75,9 +82,8 @@ def _build_shift_display_map() -> Dict[str, str]:
 
 
 def _latest_available_month_dt(db: Session, base_filters: List[Any], current_month: datetime) -> datetime:
-    """Find latest available month within last 12 months."""
+    """Find latest available month within last 12 months for given filters."""
     cutoff = current_month - relativedelta(months=11)
-
     latest = (
         db.query(func.max(func.date_trunc("month", ShiftAllowances.duration_month)))
         .filter(*base_filters)
@@ -102,7 +108,6 @@ def _fetch_mappings_bulk(db: Session, allowance_ids: List[int]) -> Dict[int, Lis
     for sid, stype, days in rows:
         out.setdefault(sid, []).append(((stype or "").upper().strip(), float(days or 0.0)))
     return out
-
 
 def export_filtered_excel_df(
     db: Session,
@@ -130,6 +135,7 @@ def export_filtered_excel_df(
 
     current_month = datetime.now().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
 
+
     if start_month or end_month:
         if not start_month:
             raise HTTPException(status_code=400, detail="start_month is required when end_month is provided")
@@ -149,6 +155,7 @@ def export_filtered_excel_df(
         latest_month = _latest_available_month_dt(db, base_filters, current_month)
         date_filters = [func.date_trunc("month", ShiftAllowances.duration_month) == latest_month]
 
+   
     rows = (
         db.query(
             ShiftAllowances.id,
@@ -175,6 +182,7 @@ def export_filtered_excel_df(
 
     if not rows:
         raise HTTPException(status_code=404, detail="No records found for given filters")
+
 
     allowance_map = {
         (item.shift_type or "").upper().strip(): float(item.amount or 0)
@@ -203,6 +211,7 @@ def export_filtered_excel_df(
             total_days += days
             total_allowance += amount
 
+           
             shift_details_parts.append(f"{shift_key}-{days:g}*{int(rate):,}=₹{int(amount):,}")
 
             header = shift_display_map.get(shift_key, shift_key)
@@ -255,8 +264,15 @@ def dataframe_to_excel_file(
     sheet_name: str = "Shift Data",
     header_row_height: int = 60,
     freeze_header: bool = True,
+    currency_cols: Optional[List[str]] = None,
 ) -> str:
-    os.makedirs(os.path.dirname(file_path), exist_ok=True)
+    os.makedirs(os.path.dirname(file_path) or ".", exist_ok=True)
+
+   
+    currency_cols = currency_cols or ["total_allowance"]
+    for c in currency_cols:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
 
     with pd.ExcelWriter(file_path, engine="xlsxwriter") as writer:
         df.to_excel(writer, sheet_name=sheet_name, index=False)
@@ -277,7 +293,14 @@ def dataframe_to_excel_file(
             "valign": "vcenter",
             "border": 1,
         })
+        inr_fmt = workbook.add_format({
+            "align": "center",
+            "valign": "vcenter",
+            "border": 1,
+            "num_format": "₹ #,##0",  
+        })
 
+ 
         for c, name in enumerate(df.columns):
             worksheet.write(0, c, name, header_fmt)
 
@@ -285,16 +308,42 @@ def dataframe_to_excel_file(
         if freeze_header:
             worksheet.freeze_panes(1, 0)
 
+        currency_set = {col.lower() for col in currency_cols}
         for c, name in enumerate(df.columns):
-            lines = str(name).split("\n")
-            longest = max((len(x) for x in lines), default=len(str(name)))
+            name_str = str(name)
+            lines = name_str.split("\n")
+            longest = max((len(x) for x in lines), default=len(name_str))
             width = min(max(longest + 2, 12), 45)
-            if str(name) in ("shift_details", "practice_remarks", "rmg_comments"):
+            if name_str in ("shift_details", "practice_remarks", "rmg_comments"):
                 width = 45
-            worksheet.set_column(c, c, width, cell_fmt)
+            fmt = inr_fmt if name_str.lower() in currency_set else cell_fmt
+            worksheet.set_column(c, c, width, fmt)
 
     return file_path
 
+
+def _atomic_write_excel(df: pd.DataFrame, final_path: str, sheet_name: str = "Shift Data") -> str:
+    """
+    Write to a temp file and atomically move into place so readers never see a partial file.
+    """
+    os.makedirs(os.path.dirname(final_path) or ".", exist_ok=True)
+    fd, temp_path = tempfile.mkstemp(dir=os.path.dirname(final_path) or ".", prefix=".tmp_", suffix=".xlsx")
+    os.close(fd)
+    try:
+        dataframe_to_excel_file(
+            df,
+            file_path=temp_path,
+            sheet_name=sheet_name,
+            currency_cols=["total_allowance"],
+        )
+        os.replace(temp_path, final_path)  
+        return final_path
+    finally:
+        if os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except Exception:
+                pass
 
 def shift_excel_download_service(
     db: Session,
@@ -305,6 +354,12 @@ def shift_excel_download_service(
     department: Optional[str] = None,
     client: Optional[str] = None,
 ) -> str:
+    """
+    Simple & safe cache:
+      - Only caches default latest-month request
+      - Rebuilds automatically when latest DB month changes
+      - If cached file is missing, regenerates
+    """
     default_latest = is_default_latest_month_request(
         emp_id=emp_id,
         client_partner=client_partner,
@@ -314,11 +369,23 @@ def shift_excel_download_service(
         end_month=end_month,
     )
 
-    if default_latest:
-        cached = cache.get(f"{LATEST_MONTH_KEY}:excel")
-        if cached and os.path.exists(cached.get("file_path", "")):
-            return cached["file_path"]
+    cache_key = f"{LATEST_MONTH_KEY}:excel"
+    latest_ym = _get_db_latest_ym(db)  
 
+   
+    if default_latest:
+        cached = cache.get(cache_key)
+        if cached:
+            cached_path = cached.get("file_path")
+            cached_month = cached.get("_cached_month")
+            if (
+                cached_path and
+                os.path.exists(cached_path) and
+                cached_month == latest_ym
+            ):
+                return cached_path
+
+  
     df = export_filtered_excel_df(
         db=db,
         emp_id=emp_id,
@@ -329,6 +396,7 @@ def shift_excel_download_service(
         client=client,
     )
 
+    
     os.makedirs(EXPORT_DIR, exist_ok=True)
     if default_latest:
         file_path = os.path.join(EXPORT_DIR, DEFAULT_EXPORT_FILE)
@@ -336,16 +404,13 @@ def shift_excel_download_service(
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         file_path = os.path.join(EXPORT_DIR, f"shift_data_{timestamp}.xlsx")
 
-    dataframe_to_excel_file(df, file_path=file_path, sheet_name="Shift Data")
+    _atomic_write_excel(df, file_path, sheet_name="Shift Data")
 
+ 
     if default_latest:
-        cached_month = None
-        if "duration_month" in df.columns and not df["duration_month"].isna().all():
-            cached_month = str(df["duration_month"].dropna().iloc[0])
-
         cache.set(
-            f"{LATEST_MONTH_KEY}:excel",
-            {"_cached_month": cached_month, "file_path": file_path},
+            cache_key,
+            {"_cached_month": latest_ym, "file_path": file_path},
             expire=CACHE_TTL,
         )
 

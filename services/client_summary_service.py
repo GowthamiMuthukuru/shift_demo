@@ -27,15 +27,13 @@ from models.models import ShiftAllowances, ShiftMapping, ShiftsAmount
 from diskcache import Cache
 
 from utils.shift_config import get_all_shift_keys
-
-
 cache = Cache("./diskcache/latest_month")
 
+CLIENT_SUMMARY_VERSION = "v2"
+BASE_CACHE_KEY = "client_summary:latest_month"
+LATEST_MONTH_KEY = f"client_summary_latest:{CLIENT_SUMMARY_VERSION}"
 
-LATEST_MONTH_KEY = "client_summary:latest_month"
-
-CACHE_TTL = 24 * 60 * 60  
-
+CACHE_TTL = 24 * 60 * 60           
 
 def clean_str(value: Any) -> str:
     """
@@ -52,10 +50,8 @@ def clean_str(value: Any) -> str:
 
     s = value.strip() if isinstance(value, str) else str(value).strip()
 
-   
     s = s.replace("\u200b", "").replace("\u00a0", "").strip()
 
-  
     for _ in range(2):
         if len(s) >= 2 and ((s[0] == s[-1]) and s[0] in ("'", '"')):
             s = s[1:-1].strip()
@@ -63,7 +59,6 @@ def clean_str(value: Any) -> str:
     if s in ("'", "''", '"', '""'):
         return ""
 
-   
     if s.upper() in ("NULL", "NONE", "NAN"):
         return ""
 
@@ -221,18 +216,23 @@ def client_summary_service(db: Session, payload: dict):
     emp_id = payload.get("emp_id")
     client_partner = payload.get("client_partner")
 
-    if is_default_latest_month_request(payload):
-        cached = cache.get(LATEST_MONTH_KEY)
-        if cached and isinstance(cached, dict) and "data" in cached:
-            
-            try:
-                latest_month = get_latest_month(db).strftime("%Y-%m")
-                cached_month = cached.get("_cached_month")
-                if cached_month == latest_month:
+    
+    use_cache = is_default_latest_month_request(payload)
+    latest_ym: Optional[str] = None
+
+    if use_cache:
+       
+        try:
+            latest_ym = get_latest_month(db).strftime("%Y-%m")
+        except HTTPException:
+            latest_ym = None  
+
+        if latest_ym:
+            cached = cache.get(LATEST_MONTH_KEY)
+            if cached and isinstance(cached, dict) and "data" in cached:
+                if cached.get("_cached_month") == latest_ym:
                     return cached["data"]
-            except Exception:
-                
-                pass
+     
 
     selected_year = payload.get("selected_year")
     selected_months = payload.get("selected_months", [])
@@ -295,7 +295,6 @@ def client_summary_service(db: Session, payload: dict):
         else:
             query = query.filter(func.lower(col).like(f"%{clean_str(client_partner).lower()}%"))
 
-    
     date_list = [m for ml in quarter_map.values() for m in ml] if selected_quarters else months
     query = query.filter(
         or_(
@@ -333,8 +332,6 @@ def client_summary_service(db: Session, payload: dict):
         dept_safe = clean_str(dept)
         cp_safe = clean_str(cp)
 
-       
-
         client_name = client_name_map.get(client_safe.lower(), client_safe or "UNKNOWN")
         dept_name = dept_name_map.get((client_safe.lower(), dept_safe.lower()), dept_safe or "UNKNOWN")
         cp_display = cp_safe or "UNKNOWN"
@@ -352,7 +349,7 @@ def client_summary_service(db: Session, payload: dict):
                 "departments": {},
                 "client_head_count": 0,
                 "client_total": 0.0,
-                "client_partner": cp_display,  
+                "client_partner": cp_display, 
             },
         )
 
@@ -372,7 +369,7 @@ def client_summary_service(db: Session, payload: dict):
             employee = {
                 "emp_id": eid,
                 "emp_name": ename,
-                "client_partner": cp_display, 
+                "client_partner": cp_display,  
                 **{k: 0.0 for k in shift_keys},
                 "total": 0.0,
             }
@@ -393,11 +390,11 @@ def client_summary_service(db: Session, payload: dict):
         month_block["month_total"][stype_norm] += total
         month_block["month_total"]["total_allowance"] += total
 
-   
-    if is_default_latest_month_request(payload):
+    
+    if use_cache and latest_ym:
         cache.set(
             LATEST_MONTH_KEY,
-            {"_cached_month": months[0].strftime("%Y-%m"), "data": response},
+            {"_cached_month": latest_ym, "data": response},
             expire=CACHE_TTL,
         )
 

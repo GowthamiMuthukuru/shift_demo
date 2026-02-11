@@ -94,5 +94,9 @@ def client_dashboard_summary(
 
 
 @router.post("/client-analytics")
-def client_analytics(payload: ClientAnalyticsRequest, db: Session = Depends(get_db)):
+def client_analytics(
+    payload: ClientAnalyticsRequest,
+    db: Session = Depends(get_db),
+    _current_user = Depends(get_current_user),
+):
     return client_analytics_service(db, payload.dict())

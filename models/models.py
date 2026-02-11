@@ -91,6 +91,7 @@ class ShiftsAmount(Base):
     payroll_year = Column(String(7), nullable=False)  # MM-YYYY
  
     created_at = Column(TIMESTAMP, server_default=func.now())
+    updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now())
  
  
 # SHIFT MAPPING TABLE
