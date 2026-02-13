@@ -11,6 +11,7 @@ from services.client_comparision_service import (client_comparison_service,
                                                  get_client_total_allowances,
                                                  get_client_departments_service,get_client_dashboard)
 from utils.dependencies import get_current_user
+from typing import Optional
 
 router = APIRouter()
 
@@ -49,18 +50,28 @@ def get_client_departments(
     return get_client_departments_service(db)
 
 
+
+
 @router.post("/dashboard", response_model=DashboardResponse)
 def dashboard(
     filters: DashboardFilter,
+    client_starts_with: Optional[str] = Query(
+        None,
+        description="Filter clients starting with given prefix (e.g., M)"
+    ),
     db: Session = Depends(get_db),
     _current_user = Depends(get_current_user)
 ):
     """
     Returns dashboard summary per client with period resolution, future messages,
-    and all filters applied. Prioritizes a single selected client:
-     - client first,
-     - then period,
-     - then top (won't drop that client).
+    and all filters applied.
+
+    client_starts_with can be passed as query param instead of body.
+    
     """
+
+    if client_starts_with:
+        filters.client_starts_with = client_starts_with
+
     return get_client_dashboard(db, filters)
 
