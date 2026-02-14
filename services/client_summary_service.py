@@ -84,7 +84,12 @@ def validate_months(months: List[int]) -> None:
 
 
 def parse_headcount_ranges(headcounts_payload):
-
+    """
+    Parses headcount ranges.
+    Returns:
+      - None  -> means ALL (no filtering)
+      - List[(start, end)]
+    """
     if headcounts_payload == "ALL":
         return None
 
@@ -125,6 +130,7 @@ def parse_headcount_ranges(headcounts_payload):
         ranges.append((start, end))
 
     return ranges
+
 
 def normalize_clients(clients_payload: Optional[Any], depts_payload: Optional[Any]) -> Tuple[Dict[str, list], Dict[str, str], dict]:
     """Normalize clients and departments"""
@@ -189,6 +195,7 @@ def build_base_query(db: Session):
         )
     )
 
+
 def client_summary_service(db: Session, payload: dict):
     """Return client summary with multi-year, multi-month, shift, and headcount filters"""
 
@@ -203,6 +210,8 @@ def client_summary_service(db: Session, payload: dict):
     shifts = payload.get("shifts", "ALL")
     headcounts_payload = payload.get("headcounts", "ALL")
 
+    
+    departments_selected = payload.get("departments") not in (None, "ALL")  
 
     if selected_years:
         for y in selected_years:
@@ -221,7 +230,7 @@ def client_summary_service(db: Session, payload: dict):
 
     headcount_ranges = parse_headcount_ranges(headcounts_payload)
 
-    
+
     use_cache = is_default_latest_month_request(payload)
     latest_ym: Optional[str] = None
     if use_cache:
@@ -254,6 +263,7 @@ def client_summary_service(db: Session, payload: dict):
 
     query = build_base_query(db)
 
+    
     if normalized_clients:
         filters = []
         for client_lc, depts_lc in normalized_clients.items():
@@ -267,7 +277,7 @@ def client_summary_service(db: Session, payload: dict):
             else:
                 filters.append(func.lower(ShiftAllowances.client) == client_lc)
         query = query.filter(or_(*filters))
-
+   
     if emp_id:
         if isinstance(emp_id, str):
             emp_id = [emp_id]
@@ -349,14 +359,25 @@ def client_summary_service(db: Session, payload: dict):
             },
         )
 
+  
         employee = next((e for e in dept_block["employees"] if e["emp_id"] == eid), None)
+
         if not employee:
-            
+           
             prospective_dept_headcount = dept_block["dept_head_count"] + 1
             prospective_client_headcount = client_block["client_head_count"] + 1
-            total_headcount_for_check = prospective_dept_headcount if normalized_clients else prospective_client_headcount
 
-            if any(start <= total_headcount_for_check <= end for start, end in headcount_ranges):
+            
+            total_headcount_for_check = (
+                prospective_dept_headcount if departments_selected else prospective_client_headcount
+            )
+
+            
+            passes_headcount = True if headcount_ranges is None else any(
+                start <= total_headcount_for_check <= end for start, end in headcount_ranges
+            )
+
+            if passes_headcount:
                 employee = {
                     "emp_id": eid,
                     "emp_name": ename,
@@ -369,8 +390,10 @@ def client_summary_service(db: Session, payload: dict):
                 client_block["client_head_count"] += 1
                 month_block["month_total"]["total_head_count"] += 1
             else:
-                continue  
+               
+                continue
 
+      
         employee[stype_norm] += total
         employee["total"] += total
         dept_block[f"dept_{stype_norm}"] += total

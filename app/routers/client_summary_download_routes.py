@@ -10,7 +10,7 @@ from services.client_summary_download_service import client_summary_download_ser
 
 router = APIRouter(
     prefix="/client-summary",
-    tags=["Client Summary"],
+   
 )
 @router.post("/download")
 def download_client_summary_excel(
