@@ -6,7 +6,7 @@ WITH file-path caching (simple, default-latest only).
 - Excel headers use config display strings (with '\n') and are wrapped in Excel.
 - Avoids stale headers by caching a 'shift signature' (keys + labels).
 - Cache technique:
-    * For default latest-month request -> stable file name cached by month + signature.
+    * For default latest-month request -> stable file name cached by filter-aware month key + signature.
     * For non-default requests -> payload-hash based file name, separately cached.
 """
 
@@ -26,14 +26,14 @@ from diskcache import Cache
 
 from utils.shift_config import get_all_shift_keys, get_shift_string
 from services.client_summary_service import (
-    client_summary_service,          
-    is_default_latest_month_request,  
-    LATEST_MONTH_KEY,
+    client_summary_service,
+    is_default_latest_month_request,
+    latest_month_cache_key,   
     CACHE_TTL,
 )
 from models.models import ShiftAllowances
 
-
+# Disk cache shared with summary service
 cache = Cache("./diskcache/latest_month")
 
 EXPORT_DIR = "exports"
@@ -56,6 +56,7 @@ def _money(v: Any) -> float:
 def _get_db_latest_ym(db: Session) -> Optional[str]:
     """
     Return latest month available in DB as 'YYYY-MM', or None if table is empty.
+    Note: This is used only to validate default cache freshness.
     """
     latest_dt = db.query(func.max(ShiftAllowances.duration_month)).scalar()
     return latest_dt.strftime("%Y-%m") if latest_dt else None
@@ -68,6 +69,7 @@ def _current_shift_signature() -> Tuple[str, ...]:
     """
     keys = [k.upper().strip() for k in get_all_shift_keys()]
     labels = [get_shift_string(k) or k for k in keys]
+    # Signature includes both keys and labels to detect renames/reorders
     return tuple(keys + labels)
 
 
@@ -82,12 +84,10 @@ def _normalize_multi_str_or_list(value: Any) -> Optional[Set[str]]:
     if isinstance(value, str):
         if value.strip().upper() == "ALL":
             return None
-       
         parts = [p.strip() for p in value.split(",") if p.strip()]
         return set(parts) if parts else None
     if isinstance(value, list):
         parts = [str(p).strip() for p in value if str(p).strip()]
-      
         if len(parts) == 1 and parts[0].upper() == "ALL":
             return None
         return set(parts) if parts else None
@@ -128,7 +128,7 @@ def _write_excel_to_path(df: pd.DataFrame, currency_cols: List[str], file_path: 
             "num_format": "₹ #,##0",
         })
 
-    
+        # Write header explicitly to apply header format
         for c, col_name in enumerate(df.columns):
             ws.write(0, c, col_name, header_fmt)
 
@@ -137,7 +137,7 @@ def _write_excel_to_path(df: pd.DataFrame, currency_cols: List[str], file_path: 
 
         currency_set = set(currency_cols)
 
-       
+        # Autosize columns with basic heuristics
         for c, col_name in enumerate(df.columns):
             lines = str(col_name).split("\n")
             longest = max((len(x) for x in lines), default=len(str(col_name)))
@@ -161,7 +161,7 @@ def _atomic_write_excel(df: pd.DataFrame, currency_cols: List[str], final_path: 
     os.close(fd)
     try:
         _write_excel_to_path(df, currency_cols, temp_path)
-        os.replace(temp_path, final_path)  
+        os.replace(temp_path, final_path)  # atomic on same filesystem
         return final_path
     finally:
         if os.path.exists(temp_path):
@@ -187,12 +187,14 @@ def _build_dataframe_from_summary(
 
     rows: List[Dict[str, Any]] = []
 
+    # Iterate periods in ascending order
     for period_key in sorted(summary_data):
         period_data = summary_data[period_key]
         clients = period_data.get("clients")
         if not clients:
             continue
 
+        # clients is a dict keyed by client_name -> client_block
         for client_name, client_block in clients.items():
             partner_value = client_block.get("client_partner", "")
             departments = client_block.get("departments", {})
@@ -200,8 +202,8 @@ def _build_dataframe_from_summary(
             for dept_name, dept_block in departments.items():
                 employees = dept_block.get("employees", [])
 
+                # If no employees (unlikely but supported), write a dept-only row
                 if not employees:
-                  
                     if partner_filter and partner_value not in partner_filter:
                         continue
 
@@ -213,8 +215,9 @@ def _build_dataframe_from_summary(
                         "Department": dept_name,
                         "Head Count": int(dept_block.get("dept_head_count", 0) or 0),
                     }
+                    # FIX: read dept totals from plain keys (not "dept_{k}")
                     for k, col in zip(shift_keys, shift_cols):
-                        row[col] = _money(dept_block.get(f"dept_{k}", 0))
+                        row[col] = _money(dept_block.get(k, 0))
                     row["Total Allowance"] = _money(dept_block.get("dept_total", 0))
                     rows.append(row)
                     continue
@@ -237,8 +240,9 @@ def _build_dataframe_from_summary(
                         "Department": dept_name,
                         "Head Count": 1,
                     }
+                    # FIX: fallback to dept shift totals using plain keys
                     for k, col in zip(shift_keys, shift_cols):
-                        row[col] = _money(emp.get(k, dept_block.get(f"dept_{k}", 0)))
+                        row[col] = _money(emp.get(k, dept_block.get(k, 0)))
                     row["Total Allowance"] = _money(emp.get("total", dept_block.get("dept_total", 0)))
                     rows.append(row)
 
@@ -246,7 +250,7 @@ def _build_dataframe_from_summary(
         raise HTTPException(404, "No data available for export")
 
     df = pd.DataFrame(rows)
-
+    # Sort period chronologically
     df["Period"] = pd.to_datetime(df["Period"], format="%Y-%m", errors="coerce")
     df = df.sort_values(by=["Period", "Client", "Department", "Employee ID"])
     df["Period"] = df["Period"].dt.strftime("%Y-%m")
@@ -254,6 +258,7 @@ def _build_dataframe_from_summary(
     ordered_cols = (
         ["Period", "Client", "Client Partner", "Employee ID", "Department", "Head Count"]
     ) + shift_cols + ["Total Allowance"]
+    # Keep only columns that exist (defensive)
     df = df[[c for c in ordered_cols if c in df.columns]]
 
     return df, shift_cols
@@ -267,13 +272,13 @@ def _payload_hash(payload: dict) -> str:
 
 def _stable_cache_key(payload: dict, default_req: bool, shift_sig: Optional[Tuple[str, ...]]) -> str:
     """
-    For default requests, use a fixed key so the file name stays stable.
-    For non-default, use a stable hash of the payload.
+    For default requests, use a fixed key so the file name stays stable,
+    based on filter-aware latest-month cache key; for non-default, use a stable hash.
     """
     if default_req:
-        return f"{LATEST_MONTH_KEY}:excel"
+        # Use filter-aware key so different clients/departments/shifts don't collide
+        return f"{latest_month_cache_key(payload)}:excel"
     return f"client_summary:{_payload_hash(payload)}.xlsx"
-
 
 
 def client_summary_download_service(db: Session, payload: dict) -> str:
@@ -287,13 +292,14 @@ def client_summary_download_service(db: Session, payload: dict) -> str:
     payload = (payload or {})
     default_req = is_default_latest_month_request(payload)
 
+    # For default requests, we validate cache freshness against the DB latest month
     latest_ym = _get_db_latest_ym(db) if default_req else None
     shift_sig = _current_shift_signature() if default_req else None
 
     cache_key = _stable_cache_key(payload, default_req, shift_sig)
     final_default_path = os.path.join(EXPORT_DIR, DEFAULT_EXPORT_FILE)
 
-    
+    # Try cache first
     cached = cache.get(cache_key)
     if cached:
         cached_path = cached.get("file_path")
@@ -314,18 +320,19 @@ def client_summary_download_service(db: Session, payload: dict) -> str:
             if cached_path and os.path.exists(cached_path):
                 return cached_path
 
+    # Build summary data
     summary_data = client_summary_service(db, payload)
     if not summary_data:
         raise HTTPException(404, "No data available")
 
-
+    # Optional row-level filters
     emp_ids_filter = _normalize_multi_str_or_list(payload.get("emp_id"))
     partner_filter = _normalize_multi_str_or_list(payload.get("client_partner"))
 
     df, shift_cols = _build_dataframe_from_summary(summary_data, emp_ids_filter, partner_filter)
     currency_cols = shift_cols + ["Total Allowance"]
 
-    
+    # Default requests -> stable file name
     if default_req:
         written_path = _atomic_write_excel(df, currency_cols, final_default_path)
         cache.set(
@@ -339,6 +346,7 @@ def client_summary_download_service(db: Session, payload: dict) -> str:
         )
         return written_path
 
+    # Non-default -> hashed filename
     hashed_name = cache_key.split(":", 1)[-1]
     if not hashed_name.endswith(".xlsx"):
         hashed_name += ".xlsx"

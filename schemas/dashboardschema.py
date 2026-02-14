@@ -175,6 +175,7 @@ class DashboardFilter(BaseModel):
     top: str = "ALL"
     client_starts_with: Optional[str] = None
 
-    sort_by: Literal["total_allowance", "client"] = "total_allowance"
+   
+    sort_by: Literal["total_allowance", "client", "client_partner", "headcount", "departments"] = "total_allowance"
     sort_order: Literal["asc", "desc", "default"] = "default"
 

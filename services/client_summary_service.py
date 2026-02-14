@@ -5,35 +5,32 @@ Features:
 - Filters by years, months, clients, departments, employees, client partners, shifts, headcount ranges.
 - Headcount range applied at dept level if departments selected, else at client level.
 - Validations for years, months, shifts, and headcount formats.
-- Caching for latest-month requests.
+- Caching for latest-month requests and month resolution with filter-aware keys.
 """
 
 from __future__ import annotations
 from datetime import date, datetime
 from typing import List, Dict, Optional, Any, Tuple
-
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
 from sqlalchemy import func, and_, or_, cast, Integer, extract
-
 from models.models import ShiftAllowances, ShiftMapping, ShiftsAmount
 from diskcache import Cache
 from utils.shift_config import get_all_shift_keys
-from dateutil.relativedelta import relativedelta
+
 
 cache = Cache("./diskcache/latest_month")
 
 CLIENT_SUMMARY_VERSION = "v3"
-LATEST_MONTH_KEY = f"client_summary_latest:{CLIENT_SUMMARY_VERSION}"
 CACHE_TTL = 24 * 60 * 60  # 24 hours
 
-
 def clean_str(value: Any) -> str:
-    """Normalize strings from DB"""
+    """Normalize strings from DB and inputs."""
     if value is None:
         return ""
     s = value.strip() if isinstance(value, str) else str(value).strip()
     s = s.replace("\u200b", "").replace("\u00a0", "").strip()
+   
     for _ in range(2):
         if len(s) >= 2 and ((s[0] == s[-1]) and s[0] in ("'", '"')):
             s = s[1:-1].strip()
@@ -45,17 +42,20 @@ def clean_str(value: Any) -> str:
 
 
 def get_shift_keys() -> List[str]:
-    """Get configured shift keys (uppercase)"""
+    """Get configured shift keys (uppercase)."""
     return [clean_str(k).upper() for k in get_all_shift_keys()]
 
 
 def empty_shift_totals(shift_keys: List[str]) -> Dict[str, float]:
-    """Zero-initialized shift totals"""
+    """Zero-initialized shift totals."""
     return {k: 0.0 for k in shift_keys}
 
 
 def is_default_latest_month_request(payload: dict) -> bool:
-    """Check if this is default latest-month summary request"""
+    """
+    Check if this is a 'default' latest-month summary request.
+    This means: no explicit years/months, no emp_id, no client_partner, and clients == ALL.
+    """
     return (
         not payload
         or (
@@ -69,7 +69,7 @@ def is_default_latest_month_request(payload: dict) -> bool:
 
 
 def validate_year(year: int) -> None:
-    """Validate year is not in future or invalid"""
+    """Validate year is not in the future or invalid."""
     current_year = date.today().year
     if year <= 0:
         raise HTTPException(400, "Year must be greater than 0")
@@ -78,7 +78,7 @@ def validate_year(year: int) -> None:
 
 
 def validate_months(months: List[int]) -> None:
-    """Validate month integers"""
+    """Validate month integers."""
     for m in months:
         if not 1 <= int(m) <= 12:
             raise HTTPException(400, f"Invalid month: {m}")
@@ -87,8 +87,9 @@ def validate_months(months: List[int]) -> None:
 def parse_headcount_ranges(headcounts_payload):
     """
     Parses headcount ranges.
+
     Returns:
-      - None  -> means ALL (no filtering)
+      - None  -> ALL (no filtering)
       - List[(start, end)]
     """
     if headcounts_payload == "ALL":
@@ -97,82 +98,35 @@ def parse_headcount_ranges(headcounts_payload):
     if isinstance(headcounts_payload, str):
         headcounts_payload = [headcounts_payload]
 
-    ranges = []
-
+    ranges: List[Tuple[int, int]] = []
     for h in headcounts_payload:
-
         if "-" in h:
             parts = h.split("-")
-
             if len(parts) != 2 or not parts[0].isdigit() or not parts[1].isdigit():
                 raise HTTPException(
                     status_code=400,
                     detail=f"Invalid headcount range format: {h}. Use '1-5'"
                 )
-
             start = int(parts[0])
             end = int(parts[1])
-
             if start > end:
                 raise HTTPException(
                     status_code=400,
                     detail=f"Invalid headcount range: {h}"
                 )
-
         elif h.isdigit():
             start = end = int(h)
-
         else:
             raise HTTPException(
                 status_code=400,
                 detail=f"Invalid headcount range format: {h}"
             )
-
         ranges.append((start, end))
-
     return ranges
 
 
-def normalize_clients(clients_payload: Optional[Any], depts_payload: Optional[Any]) -> Tuple[Dict[str, list], Dict[str, str], dict]:
-    """Normalize clients and departments"""
-    normalized_clients: dict = {}
-    client_name_map: dict = {}
-    dept_name_map: dict = {}
-
-    if not clients_payload or clients_payload == "ALL":
-        return normalized_clients, client_name_map, dept_name_map
-
-    if isinstance(clients_payload, str):
-        clients_payload = [clients_payload]
-
-    for client in clients_payload:
-        client_clean = clean_str(client)
-        client_lc = client_clean.lower()
-        client_name_map[client_lc] = client_clean
-
-        depts_list = []
-        if depts_payload not in (None, "ALL"):
-            if isinstance(depts_payload, str):
-                depts_payload = [depts_payload]
-            for d in depts_payload:
-                d_clean = clean_str(d)
-                dept_name_map[(client_lc, d_clean.lower())] = d_clean
-                depts_list.append(d_clean.lower())
-        normalized_clients[client_lc] = depts_list
-
-    return normalized_clients, client_name_map, dept_name_map
-
-
-def get_latest_month(db: Session) -> date:
-    """Fetch latest month from DB"""
-    latest = db.query(func.max(ShiftAllowances.duration_month)).scalar()
-    if not latest:
-        raise HTTPException(404, "No data available in database")
-    return date(latest.year, latest.month, 1)
-
-
 def build_base_query(db: Session):
-    """Base SQLAlchemy query"""
+    """Base SQLAlchemy query."""
     return (
         db.query(
             ShiftAllowances.duration_month,
@@ -197,14 +151,202 @@ def build_base_query(db: Session):
     )
 
 
+def prev_month(d: date) -> date:
+    """Return the previous month anchor (day=1)."""
+    if d.month == 1:
+        return date(d.year - 1, 12, 1)
+    return date(d.year, d.month - 1, 1)
+
+
+def has_data_for_month(
+    db: Session,
+    month_anchor: date,
+    clients_list: List[str],
+    departments_list: List[str],
+    emp_id: Optional[List[str]],
+    client_partner: Optional[Any],
+    allowed_shifts: Optional[set],
+) -> bool:
+    """
+    Lightweight check: is there any data for this month with the given filters?
+    """
+    q = (
+        db.query(func.count(ShiftAllowances.id))
+        .join(ShiftMapping, ShiftMapping.shiftallowance_id == ShiftAllowances.id)
+        .filter(
+            extract("year", ShiftAllowances.duration_month) == month_anchor.year,
+            extract("month", ShiftAllowances.duration_month) == month_anchor.month,
+        )
+    )
+
+    # Clients + Departments filter (same logic as main query)
+    if clients_list:
+        client_filters = []
+        if departments_list:
+            depts_lower = [d.lower() for d in departments_list]
+            for c in clients_list:
+                client_filters.append(
+                    and_(
+                        func.lower(ShiftAllowances.client) == c.lower(),
+                        func.lower(ShiftAllowances.department).in_(depts_lower),
+                    )
+                )
+        else:
+            for c in clients_list:
+                client_filters.append(func.lower(ShiftAllowances.client) == c.lower())
+        if client_filters:
+            q = q.filter(or_(*client_filters))
+
+    # emp_id filter
+    if emp_id:
+        if isinstance(emp_id, str):
+            emp_id = [emp_id]
+        q = q.filter(func.lower(ShiftAllowances.emp_id).in_([clean_str(e).lower() for e in emp_id]))
+
+    # client_partner filter
+    if client_partner:
+        col = ShiftAllowances.client_partner
+        if isinstance(client_partner, list):
+            parts = [clean_str(cp) for cp in client_partner if clean_str(cp)]
+            if parts:
+                q = q.filter(
+                    or_(*[func.lower(col).like(f"%{p.lower()}%") for p in parts])
+                )
+        else:
+            q = q.filter(func.lower(col).like(f"%{clean_str(client_partner).lower()}%"))
+
+    # allowed shifts filter
+    if allowed_shifts and len(allowed_shifts) > 0:
+        q = q.filter(func.upper(ShiftMapping.shift_type).in_(list(allowed_shifts)))
+
+    count_val = q.scalar() or 0
+    return count_val > 0
+
+
+def latest_month_cache_key(payload: dict) -> str:
+    """
+    Builds a filter-aware cache key for latest-month resolution and response caching.
+    Only includes filters that affect data presence.
+    """
+    parts = {
+        "clients": payload.get("clients", "ALL"),
+        "departments": payload.get("departments", "ALL"),
+        "emp_id": payload.get("emp_id"),
+        "client_partner": payload.get("client_partner"),
+        "shifts": payload.get("shifts", "ALL"),
+    }
+    return f"client_summary_latest:{CLIENT_SUMMARY_VERSION}:{str(parts)}"
+
+
+def resolve_target_months_with_fallback(
+    db: Session,
+    payload: dict,
+    clients_list: List[str],
+    departments_list: List[str],
+    emp_id: Optional[Any],
+    client_partner: Optional[Any],
+    allowed_shifts: Optional[set],
+    max_lookback_months: int = 12,
+) -> List[date]:
+    """
+    Month determination logic:
+
+    - Years & Months both -> Cartesian product (all combinations, sorted ascending, deduped).
+    - Years only -> all 12 months in those years (sorted).
+    - Months only -> assume current year (sorted).
+    - Neither -> try current month; if no data, walk backward up to `max_lookback_months`;
+      else fallback to absolute latest month in DB; else current month if DB empty.
+    """
+    selected_years_raw = payload.get("years", [])
+    selected_months_raw = payload.get("months", [])
+
+    # Normalize and validate once
+    selected_years = [int(y) for y in selected_years_raw] if selected_years_raw else []
+    selected_months = [int(m) for m in selected_months_raw] if selected_months_raw else []
+
+    # Validate
+    if selected_years:
+        for y in selected_years:
+            validate_year(int(y))
+    if selected_months:
+        validate_months(selected_months)
+
+    # Deduplicate and sort for deterministic output
+    selected_years = sorted(set(selected_years))
+    selected_months = sorted(set(selected_months))
+
+    # 1) Both provided -> CARTESIAN PRODUCT
+    if selected_years and selected_months:
+        # Build all (year, month) pairs
+        combos = []
+        for y in selected_years:
+            for m in selected_months:
+                combos.append(date(int(y), int(m), 1))
+        # Sort to ensure ascending chronological order
+        combos.sort()
+        return combos
+
+    # 2) Only years provided -> all months of those years
+    if selected_years and not selected_months:
+        months = []
+        for y in selected_years:
+            for m in range(1, 13):
+                months.append(date(int(y), m, 1))
+        months.sort()
+        return months
+
+    # 3) Only months provided -> current year
+    if selected_months and not selected_years:
+        current_year = date.today().year
+        months = [date(current_year, int(m), 1) for m in selected_months]
+        months.sort()
+        return months
+
+    # 4) Neither provided -> resolve latest with fallback and cache (filter-aware key)
+    lm_key = latest_month_cache_key(payload)
+    cached_month = cache.get(lm_key)
+    if cached_month:
+        return [cached_month]
+
+    current = date.today().replace(day=1)
+
+    if has_data_for_month(
+        db, current, clients_list, departments_list, emp_id, client_partner, allowed_shifts
+    ):
+        cache.set(lm_key, current, expire=CACHE_TTL)
+        return [current]
+
+    # Walk back up to max_lookback_months
+    probe = current
+    for _ in range(max_lookback_months):
+        probe = prev_month(probe)
+        if has_data_for_month(
+            db, probe, clients_list, departments_list, emp_id, client_partner, allowed_shifts
+        ):
+            cache.set(lm_key, probe, expire=CACHE_TTL)
+            return [probe]
+
+    # Final fallback: absolute latest month in DB (no filters)
+    latest_dm = db.query(func.max(ShiftAllowances.duration_month)).scalar()
+    if latest_dm:
+        month1 = latest_dm.replace(day=1)
+        cache.set(lm_key, month1, expire=CACHE_TTL)
+        return [month1]
+
+    # DB empty -> return current month
+    cache.set(lm_key, current, expire=CACHE_TTL)
+    return [current]
+
 def client_summary_service(db: Session, payload: dict):
-    """Return client summary with multi-year, multi-month, shift, and headcount filters with sorting"""
+    """
+    Return client summary with multi-year, multi-month, shift, and headcount filters with sorting.
+    Caches the final response for requests that do not explicitly pass years/months (latest-month-style).
+    """
 
     payload = payload or {}
     shift_keys = get_shift_keys()
     shift_key_set = set(shift_keys)
 
-   
     clients_raw = payload.get("clients", "ALL")
     departments_raw = payload.get("departments", "ALL")
     emp_id = payload.get("emp_id")
@@ -214,16 +356,20 @@ def client_summary_service(db: Session, payload: dict):
     shifts = payload.get("shifts", "ALL")
     headcounts_payload = payload.get("headcounts", "ALL")
     sort_by = payload.get("sort_by", "total_allowance")
-    sort_order = payload.get("sort_order", "default")
+    sort_order = payload.get("sort_order", "default")  # 'asc' | 'desc' | 'default'
 
- 
+    # Normalize clients
     if isinstance(clients_raw, str):
-        clients_list = [c.strip() for c in clients_raw.split(",") if c.strip()]
+        if clients_raw == "ALL":
+            clients_list: List[str] = []
+        else:
+            clients_list = [c.strip() for c in clients_raw.split(",") if c.strip()]
     elif isinstance(clients_raw, list):
         clients_list = [c.strip() for c in clients_raw if c]
     else:
         clients_list = []
 
+    # Normalize departments
     if isinstance(departments_raw, str):
         departments_list = [departments_raw.strip()] if departments_raw != "ALL" else []
     elif isinstance(departments_raw, list):
@@ -233,13 +379,15 @@ def client_summary_service(db: Session, payload: dict):
 
     departments_selected = bool(departments_list)
 
+    # Validate years/months
     if selected_years:
         for y in selected_years:
             validate_year(int(y))
     if selected_months:
         validate_months(selected_months)
 
-
+    # Normalize shifts; build allowed set for filtering
+    allowed_shifts_for_filter: set = set()
     if shifts != "ALL":
         if isinstance(shifts, str):
             shifts = [shifts]
@@ -247,110 +395,117 @@ def client_summary_service(db: Session, payload: dict):
         invalid_shifts = [s for s in shifts_upper if s not in shift_key_set]
         if invalid_shifts:
             raise HTTPException(400, f"Invalid shift(s): {invalid_shifts}")
-        shift_key_set = set(shifts_upper)
+        allowed_shifts_for_filter = set(shifts_upper)
+        # Limit key set to selected shifts
+        shift_key_set = allowed_shifts_for_filter.copy()
+    else:
+        # All shifts allowed
+        allowed_shifts_for_filter = set(shift_keys)
 
-   
+    # Parse headcount ranges
     headcount_ranges = parse_headcount_ranges(headcounts_payload)
 
-    months_to_use: List[date] = []
-
-    if not selected_years and not selected_months:
-        # No year/month -> try current month
-        current_month_date = date.today().replace(day=1)
-        query_current = db.query(ShiftAllowances)
-        if clients_list:
-            query_current = query_current.filter(
-                or_(*[ShiftAllowances.client.ilike(f"%{c}%") for c in clients_list])
-            )
-        current_exists = query_current.filter(ShiftAllowances.duration_month == current_month_date).first()
-        if current_exists:
-            months_to_use = [current_month_date]
-        else:
-            # fallback: latest 12 months in DB
-            latest_dm = db.query(func.max(ShiftAllowances.duration_month)).scalar()
-            if latest_dm:
-                latest_start = latest_dm.replace(day=1) - relativedelta(months=11)
-                months_to_use = [
-                    (latest_start + relativedelta(months=i)) for i in range(12)
-                ]
-            else:
-                months_to_use = [current_month_date]
-    elif selected_months and not selected_years:
-        current_year = date.today().year
-        months_to_use = [date(current_year, int(m), 1) for m in selected_months]
-    elif selected_years and not selected_months:
-        # full year -> months 1-12
-        months_to_use = [date(int(y), m, 1) for y in selected_years for m in range(1, 13)]
-    else:
-        # both year and month selected
-        months_to_use = [date(int(y), int(m), 1) for y in selected_years for m in selected_months]
+ 
+    months_to_use: List[date] = resolve_target_months_with_fallback(
+        db=db,
+        payload=payload,
+        clients_list=clients_list,
+        departments_list=departments_list,
+        emp_id=emp_id,
+        client_partner=client_partner,
+        allowed_shifts=allowed_shifts_for_filter,
+    )
 
  
-    response: dict = {m.strftime("%Y-%m"): {"message": f"No data found for {m.strftime('%Y-%m')}"} for m in months_to_use}
+    latest_style_request = (not selected_years and not selected_months)
+    response_cache_key = None
+    if latest_style_request:
+        response_cache_key = f"{latest_month_cache_key(payload)}:response"
+        cached_resp = cache.get(response_cache_key)
+        if cached_resp:
+            return cached_resp
 
     query = build_base_query(db)
 
-    # Filter clients
+    # Filter clients/departments (same logic used in has_data_for_month)
     if clients_list:
         client_filters = []
-        for c in clients_list:
-            c_lower = c.lower()
-            if departments_selected:
-                depts_lower = [d.lower() for d in departments_list]
+        if departments_list:
+            depts_lower = [d.lower() for d in departments_list]
+            for c in clients_list:
                 client_filters.append(
                     and_(
-                        func.lower(ShiftAllowances.client) == c_lower,
+                        func.lower(ShiftAllowances.client) == c.lower(),
                         func.lower(ShiftAllowances.department).in_(depts_lower)
                     )
                 )
-            else:
-                client_filters.append(func.lower(ShiftAllowances.client) == c_lower)
-        query = query.filter(or_(*client_filters))
+        else:
+            for c in clients_list:
+                client_filters.append(func.lower(ShiftAllowances.client) == c.lower())
+        if client_filters:
+            query = query.filter(or_(*client_filters))
 
     # Filter emp_id
     if emp_id:
         if isinstance(emp_id, str):
             emp_id = [emp_id]
-        query = query.filter(func.lower(ShiftAllowances.emp_id).in_([clean_str(e).lower() for e in emp_id]))
+        query = query.filter(
+            func.lower(ShiftAllowances.emp_id).in_([clean_str(e).lower() for e in emp_id])
+        )
 
     # Filter client_partner
     if client_partner:
         col = ShiftAllowances.client_partner
         if isinstance(client_partner, list):
-            filters = [
+            filters_cp = [
                 func.lower(col).like(f"%{clean_str(cp).lower()}%")
                 for cp in client_partner if clean_str(cp)
             ]
-            if filters:
-                query = query.filter(or_(*filters))
+            if filters_cp:
+                query = query.filter(or_(*filters_cp))
         else:
             query = query.filter(func.lower(col).like(f"%{clean_str(client_partner).lower()}%"))
 
     # Filter months
     query = query.filter(
-        or_(*[and_(extract("year", ShiftAllowances.duration_month) == m.year,
-                   extract("month", ShiftAllowances.duration_month) == m.month) for m in months_to_use])
+        or_(*[
+            and_(
+                extract("year", ShiftAllowances.duration_month) == m.year,
+                extract("month", ShiftAllowances.duration_month) == m.month
+            )
+            for m in months_to_use
+        ])
     )
 
+    # Optionally filter by shifts early (to reduce rows)
+    if allowed_shifts_for_filter and len(allowed_shifts_for_filter) > 0:
+        query = query.filter(func.upper(ShiftMapping.shift_type).in_(list(allowed_shifts_for_filter)))
+
+    # Execute query
     rows = query.all()
+
+    
+    response: dict = {}
 
     for dm, client, dept, eid, ename, cp, stype, days, amt in rows:
         stype_norm = clean_str(stype).upper()
         if stype_norm not in shift_key_set:
+            # Skip shifts not in the selected set (if user narrowed shifts)
             continue
 
         period_key = dm.strftime("%Y-%m")
-        if "message" in response.get(period_key, {}):
-            response[period_key] = {
+        month_block = response.setdefault(
+            period_key,
+            {
                 "clients": {},
                 "month_total": {
                     "total_head_count": 0,
                     **{k: 0.0 for k in shift_keys},
-                    "total_allowance": 0.0,
+                    "total_allowance": 0.0
                 }
             }
+        )
 
-        month_block = response[period_key]
         client_safe = clean_str(client)
         dept_safe = clean_str(dept)
         cp_safe = clean_str(cp)
@@ -358,11 +513,12 @@ def client_summary_service(db: Session, payload: dict):
         client_block = month_block["clients"].setdefault(
             client_safe,
             {
+                "client_name": client_safe,  # for sorting/keying
                 **{k: 0.0 for k in shift_keys},
                 "departments": {},
                 "client_head_count": 0,
                 "client_total": 0.0,
-                "client_partner": cp_safe or "UNKNOWN",
+                "client_partner": cp_safe or "UNKNOWN"
             }
         )
 
@@ -372,21 +528,24 @@ def client_summary_service(db: Session, payload: dict):
                 **{k: 0.0 for k in shift_keys},
                 "dept_total": 0.0,
                 "employees": [],
-                "dept_head_count": 0,
+                "dept_head_count": 0
             }
         )
 
+        # Employee aggregation with headcount range semantics
         employee = next((e for e in dept_block["employees"] if e["emp_id"] == eid), None)
         if not employee:
             prospective_dept_headcount = dept_block["dept_head_count"] + 1
             prospective_client_headcount = client_block["client_head_count"] + 1
-            total_headcount_for_check = prospective_dept_headcount if departments_selected else prospective_client_headcount
-
+            # Range check at dept level if departments selected; else at client level
+            total_headcount_for_check = (
+                prospective_dept_headcount if departments_selected else prospective_client_headcount
+            )
             passes_headcount = True if headcount_ranges is None else any(
                 start <= total_headcount_for_check <= end for start, end in headcount_ranges
             )
-
             if not passes_headcount:
+                
                 continue
 
             employee = {
@@ -394,35 +553,48 @@ def client_summary_service(db: Session, payload: dict):
                 "emp_name": ename,
                 "client_partner": cp_safe or "UNKNOWN",
                 **{k: 0.0 for k in shift_keys},
-                "total": 0.0,
+                "total": 0.0
             }
             dept_block["employees"].append(employee)
             dept_block["dept_head_count"] += 1
             client_block["client_head_count"] += 1
             month_block["month_total"]["total_head_count"] += 1
 
-        employee[stype_norm] += float(days or 0) * float(amt or 0)
-        employee["total"] += float(days or 0) * float(amt or 0)
-        dept_block[stype_norm] += float(days or 0) * float(amt or 0)
-        dept_block["dept_total"] += float(days or 0) * float(amt or 0)
-        client_block[stype_norm] += float(days or 0) * float(amt or 0)
-        client_block["client_total"] += float(days or 0) * float(amt or 0)
-        month_block["month_total"][stype_norm] += float(days or 0) * float(amt or 0)
-        month_block["month_total"]["total_allowance"] += float(days or 0) * float(amt or 0)
+        # Monetary aggregation
+        val = float(days or 0) * float(amt or 0)
+        employee[stype_norm] += val
+        employee["total"] += val
+        dept_block[stype_norm] += val
+        dept_block["dept_total"] += val
+        client_block[stype_norm] += val
+        client_block["client_total"] += val
+        month_block["month_total"][stype_norm] += val
+        month_block["month_total"]["total_allowance"] += val
 
-   
+  
     for period, pdata in response.items():
-        clients_data = list(pdata.get("clients", {}).values())
-        if sort_by.lower() == "head_count":
-            clients_data.sort(key=lambda x: x.get("client_head_count", 0), reverse=(sort_order=="desc"))
-        elif sort_by.lower() == "client":
-            clients_data.sort(key=lambda x: x.get("client") or "", reverse=(sort_order=="desc"))
-        elif sort_by.lower() == "client_partner":
-            clients_data.sort(key=lambda x: x.get("client_partner") or "", reverse=(sort_order=="desc"))
-        elif sort_by.lower() == "departments":
-            clients_data.sort(key=lambda x: len(x.get("departments", {})), reverse=(sort_order=="desc"))
-        elif sort_by.lower() == "total_allowance":
-            clients_data.sort(key=lambda x: x.get("client_total", 0.0), reverse=(sort_order=="desc"))
-        pdata["clients"] = {c.get("emp_id", c.get("client")): c for c in clients_data}
+        clients_map = pdata.get("clients", {})
+        clients_data = list(clients_map.values())
+
+        reverse = (sort_order == "desc")
+        sort_key = sort_by.lower()
+
+        if sort_key == "head_count":
+            clients_data.sort(key=lambda x: x.get("client_head_count", 0), reverse=reverse)
+        elif sort_key == "client":
+            clients_data.sort(key=lambda x: (x.get("client_name") or "").lower(), reverse=reverse)
+        elif sort_key == "client_partner":
+            clients_data.sort(key=lambda x: (x.get("client_partner") or "").lower(), reverse=reverse)
+        elif sort_key == "departments":
+            clients_data.sort(key=lambda x: len(x.get("departments", {})), reverse=reverse)
+        elif sort_key == "total_allowance":
+            clients_data.sort(key=lambda x: x.get("client_total", 0.0), reverse=reverse)
+       
+
+        pdata["clients"] = {c["client_name"]: c for c in clients_data}
+
+    
+    if latest_style_request and response_cache_key:
+        cache.set(response_cache_key, response, expire=CACHE_TTL)
 
     return response

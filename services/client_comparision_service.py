@@ -867,20 +867,20 @@ def _extract_employee_id(row: ShiftAllowances) -> Optional[str]:
     return None
 
 
-
 def get_client_dashboard(db: Session, filters) -> Dict[str, Any]:
     """
-    Builds a client dashboard with departments count, headcount, and total allowance,
+    Builds a client dashboard with departments count, headcount, client partner, and total allowance,
     following the corrected period resolution logic and filters.
+    Supports sorting and top N limits.
     """
     today = date.today()
 
-    
     if filters.years and filters.years != [0]:
         for y in filters.years:
             yi = _safe_int(y)
             if yi is None or yi < 2000 or yi > today.year + 5:
                 raise HTTPException(400, f"Invalid year: {y}")
+
 
     if filters.months and filters.months != [0]:
         for m in filters.months:
@@ -892,8 +892,7 @@ def get_client_dashboard(db: Session, filters) -> Dict[str, Any]:
     VALID_SHIFTS = set(get_all_shift_keys())
     if filters.shifts != "ALL":
         shifts_to_check = (
-            filters.shifts if isinstance(filters.shifts, list)
-            else [filters.shifts]
+            filters.shifts if isinstance(filters.shifts, list) else [filters.shifts]
         )
         for s in shifts_to_check:
             shift_key = str(s).upper().strip()
@@ -905,37 +904,30 @@ def get_client_dashboard(db: Session, filters) -> Dict[str, Any]:
         values = filters.headcounts if isinstance(filters.headcounts, list) else [filters.headcounts]
         for item in values:
             s = str(item).strip()
-
             if "+" in s:
                 raise HTTPException(
                     status_code=400,
                     detail=f"Invalid headcount format: {item}. Use format like 1-10."
                 )
-
             if "-" in s:
                 parts = s.split("-")
-                if (
-                    len(parts) != 2
-                    or not parts[0].isdigit()
-                    or not parts[1].isdigit()
-                ):
+                if len(parts) != 2 or not parts[0].isdigit() or not parts[1].isdigit():
                     raise HTTPException(
                         status_code=400,
                         detail=f"Invalid headcount range: {item}. Use format like 1-10."
                     )
-
                 if int(parts[0]) > int(parts[1]):
                     raise HTTPException(
                         status_code=400,
                         detail=f"Invalid headcount range (start > end): {item}"
                     )
-
             elif not s.isdigit():
                 raise HTTPException(
                     status_code=400,
                     detail=f"Invalid headcount format: {item}. Use 5 or 1-10."
                 )
 
+   
     if filters.top is None or str(filters.top).lower() == "all":
         top_int = None
     else:
@@ -945,13 +937,12 @@ def get_client_dashboard(db: Session, filters) -> Dict[str, Any]:
         if top_int <= 0:
             raise HTTPException(400, "top must be > 0")
 
+  
     rate_rows = db.query(ShiftsAmount).all()
     rates = {str(r.shift_type).upper(): Decimal(r.amount) for r in rate_rows}
 
-    
-    q = db.query(ShiftAllowances)
-
    
+    q = db.query(ShiftAllowances)
     if getattr(filters, "client_starts_with", None):
         prefix = filters.client_starts_with.strip().lower()
         q = q.filter(func.lower(func.trim(ShiftAllowances.client)).like(f"{prefix}%"))
@@ -963,23 +954,21 @@ def get_client_dashboard(db: Session, filters) -> Dict[str, Any]:
             norm = filters.clients.strip().lower()
             q = q.filter(func.lower(func.trim(ShiftAllowances.client)) == norm)
 
+    # --- RESOLVE PERIODS ---
     years, months_by_year, messages = _resolve_periods_and_messages(db, q, filters, today)
-
     pair_clauses = []
     for y, ms in months_by_year.items():
         pair_clauses.append(and_(
             func.extract("year", ShiftAllowances.duration_month) == y,
             func.extract("month", ShiftAllowances.duration_month).in_(ms)
         ))
-
     if pair_clauses:
         q = q.filter(or_(*pair_clauses))
 
     rows = q.all()
-
-    
     hc_rules = _parse_headcount_filter(filters.headcounts)
 
+  
     selected_shifts: Optional[Set[str]] = None
     if filters.shifts != "ALL":
         if isinstance(filters.shifts, list):
@@ -987,6 +976,7 @@ def get_client_dashboard(db: Session, filters) -> Dict[str, Any]:
         else:
             selected_shifts = {str(filters.shifts).upper()}
 
+ 
     employees_by_client: Dict[str, Set[str]] = {}
     departments_by_client: Dict[str, Set[str]] = {}
     allowances_by_client: Dict[str, Decimal] = {}
@@ -1001,11 +991,9 @@ def get_client_dashboard(db: Session, filters) -> Dict[str, Any]:
 
         if emp:
             employees_by_client[client].add(emp)
-
         if getattr(row, "department", None):
             departments_by_client[client].add(row.department)
 
-       
         for mapping in getattr(row, "shift_mappings", []):
             shift_key = str(mapping.shift_type).upper()
             if selected_shifts and shift_key not in selected_shifts:
@@ -1017,28 +1005,42 @@ def get_client_dashboard(db: Session, filters) -> Dict[str, Any]:
             rate = rates.get(shift_key, Decimal(0))
             allowances_by_client[client] += days * rate
 
-    
     items = []
     for client, total in allowances_by_client.items():
         hc = len(employees_by_client.get(client, []))
         if not _headcount_matches(hc, hc_rules):
             continue
 
+        client_partner_set = {row.client_partner for row in rows if row.client == client and getattr(row, "client_partner", None)}
+        client_partner = next(iter(client_partner_set), None) if client_partner_set else None
+
         items.append({
             "client": client,
+            "client_partner": client_partner,
             "departments": len(departments_by_client.get(client, [])),
             "headcount": hc,
             "total_allowance": float(total),
         })
 
-    items.sort(key=lambda x: x["total_allowance"], reverse=True)
+    
+    sort_by = getattr(filters, "sort_by", "total_allowance")
+    sort_order = getattr(filters, "sort_order", "desc").lower()
+    valid_sort_keys = {"client", "client_partner", "headcount", "total_allowance", "departments"}
+
+    if sort_by not in valid_sort_keys:
+        raise HTTPException(400, f"Invalid sort_by value: {sort_by}. Must be one of {valid_sort_keys}")
+
+    reverse = sort_order == "desc"
+    items.sort(key=lambda x: x.get(sort_by) or "", reverse=reverse)
 
     if top_int:
         items = items[:top_int]
 
+   
     dashboard = OrderedDict()
     for it in items:
         dashboard[it["client"]] = {
+            "client_partner": it["client_partner"],
             "departments": it["departments"],
             "headcount": it["headcount"],
             "total_allowance": it["total_allowance"],
@@ -1047,7 +1049,6 @@ def get_client_dashboard(db: Session, filters) -> Dict[str, Any]:
     if not dashboard and not messages:
         messages.append("No data found for selected filters.")
 
-    
     selected_periods = _group_selected_periods_from_map(months_by_year)
 
     return {
