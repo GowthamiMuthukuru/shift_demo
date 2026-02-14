@@ -52,12 +52,6 @@ def fetch_employee_details(
     """
     Fetch employee shift details using the provided request body filters.
 
-    Notes:
-    - No date-range (start_month, end_month) supported.
-    - If neither years nor months are provided → current month (if no data, fallback within last 12 months).
-    - If months provided without years → current year (exclude future months).
-    - Pagination is applied on UNIQUE employees (aggregated across selected months).
-    - 'headcounts' filter applies to group headcount (per department if departments != "ALL", else per client).
     """
     # Backward-compat support for legacy keys if present
     clients_payload = payload.get("clients", payload.get("client", "ALL"))

@@ -203,29 +203,45 @@ def _apply_headcount_filter(unique_employees: List[Dict[str, Any]], group_key: O
 
 def _compute_row_totals(db: Session, row, rates: Dict[str, float]):
     shift_days: Dict[str, float] = {}
+    shift_amount: Dict[str, float] = {}
     total = 0.0
-    mappings = db.query(ShiftMapping).filter(ShiftMapping.shiftallowance_id == row.id).all()
+
+    mappings = db.query(ShiftMapping).filter(
+        ShiftMapping.shiftallowance_id == row.id
+    ).all()
+
     for m in mappings:
         days = float(m.days or 0)
         if days <= 0:
             continue
+
         shift_key = (m.shift_type or "").upper().strip()
         rate = float(rates.get(shift_key, 0.0))
         amount = days * rate
-        shift_days[shift_key] = shift_days.get(shift_key, 0.0) + amount
+
+        shift_days[shift_key] = shift_days.get(shift_key, 0.0) + days
+
+     
+        shift_amount[shift_key] = shift_amount.get(shift_key, 0.0) + amount
+
         total += amount
-    return shift_days, total
+
+    return shift_days, shift_amount, total
 
 def _aggregate_unique_employees(db: Session, rows, rates: Dict[str, float]) -> List[Dict[str, Any]]:
+
     def _ym_to_key(ym: str) -> Tuple[int, int]:
         y, m = ym.split("-")
         return int(y), int(m)
 
     agg: Dict[str, Dict[str, Any]] = {}
+
     for row in rows:
-        row_shift_days, row_total = _compute_row_totals(db, row, rates)
+        row_shift_days, row_shift_amount, row_total = _compute_row_totals(db, row, rates)
+
         emp_id = row.emp_id
         latest_ym = row.duration_month
+
         if emp_id not in agg:
             agg[emp_id] = {
                 "emp_id": row.emp_id,
@@ -236,15 +252,28 @@ def _aggregate_unique_employees(db: Session, rows, rates: Dict[str, float]) -> L
                 "client_partner": row.client_partner,
                 "duration_month": row.duration_month,
                 "payroll_month": row.payroll_month,
-                "shift_details": dict(row_shift_days),
+
+             
+                "shift_days": dict(row_shift_days),
+
+              
+                "shift_details": dict(row_shift_amount),
+
                 "total_allowance": float(row_total),
                 "_latest_key": _ym_to_key(latest_ym),
             }
         else:
             cur = agg[emp_id]
+
+          
             for k, v in row_shift_days.items():
+                cur["shift_days"][k] = cur["shift_days"].get(k, 0.0) + v
+
+            for k, v in row_shift_amount.items():
                 cur["shift_details"][k] = cur["shift_details"].get(k, 0.0) + v
+
             cur["total_allowance"] += float(row_total)
+
             if _ym_to_key(latest_ym) > cur["_latest_key"]:
                 cur["_latest_key"] = _ym_to_key(latest_ym)
                 cur["department"] = row.department or "UNKNOWN"
@@ -255,11 +284,14 @@ def _aggregate_unique_employees(db: Session, rows, rates: Dict[str, float]) -> L
                 cur["payroll_month"] = row.payroll_month
 
     unique_employees: List[Dict[str, Any]] = []
+
     for emp in agg.values():
+        emp["shift_days"] = {k: round(v, 2) for k, v in emp["shift_days"].items()}
         emp["shift_details"] = {k: round(v, 2) for k, v in emp["shift_details"].items()}
         emp["total_allowance"] = round(float(emp["total_allowance"]), 2)
         emp.pop("_latest_key", None)
         unique_employees.append(emp)
+
     return unique_employees
 
 def aggregate_shift_details(db, rows, rates):
