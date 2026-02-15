@@ -365,42 +365,41 @@ def client_summary_download_service(db: Session, payload: dict) -> str:
     """
     Generate and export client summary Excel with a simplified caching strategy.
 
-    Enhancements in this version:
+    Enhancements:
     - SORTING ONLY for months/years (ascending).
-    - If some requested periods have no data, we do NOT throw; we add a 'Notes' sheet listing them.
+    - If some requested periods have no data, we add a 'Notes' sheet listing them.
     - If no data at all for requested selection, we write a Notes-only Excel instead of raising.
     """
 
-    payload = (payload or {})
-
-    
-    payload["clients"] = normalize_all_list(payload.get("clients"))
-    payload["departments"] = normalize_all_list(payload.get("departments"))
+    payload = payload or {}
 
     default_req = is_default_latest_month_request(payload)
 
-    # Sort months & years ascending
+
     if isinstance(payload.get("months"), list) and payload["months"]:
         payload["months"] = sorted({int(m) for m in payload["months"]})
+
     if isinstance(payload.get("years"), list) and payload["years"]:
         payload["years"] = sorted({int(y) for y in payload["years"]})
 
-    # Build requested periods list for later comparison
+
     requested_periods = _requested_periods_from_payload(payload)
 
-    # For default requests, validate cache freshness
+    
     latest_ym = _get_db_latest_ym(db) if default_req else None
     shift_sig = _current_shift_signature() if default_req else None
 
     cache_key = _stable_cache_key(payload, default_req, shift_sig)
     final_default_path = os.path.join(EXPORT_DIR, DEFAULT_EXPORT_FILE)
-
     cached = cache.get(cache_key)
+
     if cached:
         cached_path = cached.get("file_path")
+
         if default_req:
             cached_month = cached.get("_cached_month")
             cached_signature = cached.get("shift_sig")
+
             if (
                 cached_path
                 and os.path.exists(cached_path)
@@ -415,6 +414,7 @@ def client_summary_download_service(db: Session, payload: dict) -> str:
             if cached_path and os.path.exists(cached_path):
                 return cached_path
 
+   
     notes_lines: List[str] = []
 
     try:
@@ -470,10 +470,11 @@ def client_summary_download_service(db: Session, payload: dict) -> str:
 
     currency_cols = shift_cols + ["Total Allowance"]
 
-   
+ 
     if requested_periods:
         present_periods = set(summary_data.keys())
         missing_periods = [p for p in requested_periods if p not in present_periods]
+
         if missing_periods:
             pretty_missing = ", ".join(missing_periods)
             notes_lines.append(
@@ -505,20 +506,24 @@ def client_summary_download_service(db: Session, payload: dict) -> str:
                 hashed_name += ".xlsx"
 
             path = os.path.join(EXPORT_DIR, hashed_name)
+
             written_path = _atomic_write_excel(
                 pd.DataFrame(), [], path, notes_lines=notes_lines
             )
+
             cache.set(
                 cache_key,
                 {"file_path": written_path},
                 expire=CACHE_TTL,
             )
+
             return written_path
 
     if default_req:
         written_path = _atomic_write_excel(
             df, currency_cols, final_default_path, notes_lines=notes_lines
         )
+
         cache.set(
             cache_key,
             {
@@ -528,6 +533,7 @@ def client_summary_download_service(db: Session, payload: dict) -> str:
             },
             expire=CACHE_TTL,
         )
+
         return written_path
 
     hashed_name = cache_key.split(":", 1)[-1]

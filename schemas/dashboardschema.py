@@ -198,14 +198,43 @@ class DashboardFilter(BaseModel):
     sort_by: Literal["total_allowance", "client", "client_partner", "headcount", "departments"] = "total_allowance"
     sort_order: Literal["asc", "desc", "default"] = "default"
 
+
+
+
 class ClientSummaryRequest(BaseModel):
     years: Optional[List[int]] = None
     months: Optional[List[int]] = None
-    clients: Optional[List[str]] = None
-    departments: Optional[List[str]] = None
+
+  
+    clients: Optional[Union[Literal["ALL"], List[str]]] = "ALL"
+    departments: Optional[Union[Literal["ALL"], List[str]]] = "ALL"
+
     emp_id: Optional[List[str]] = None
     client_partner: Optional[List[str]] = None
-    shifts: Optional[Union[List[str], str]] = None
-    headcounts: Optional[str] = None
+
+    shifts: Optional[Union[Literal["ALL"], List[str]]] = "ALL"
+    headcounts: Optional[Union[Literal["ALL"], List[str]]] = "ALL"
+
     sort_by: Optional[str] = None
     sort_order: Optional[str] = None
+
+    @field_validator("clients", "departments", "shifts", "headcounts")
+    def validate_all_or_list(cls, v):
+        if v is None:
+            return "ALL"
+
+        if v == "ALL":
+            return v
+
+        if isinstance(v, list):
+            cleaned = [str(x).strip() for x in v if str(x).strip()]
+            if not cleaned:
+                raise ValueError("List cannot be empty")
+
+            if len(cleaned) == 1 and cleaned[0].upper() == "ALL":
+                raise ValueError("'ALL' must be sent as string, not inside list")
+
+            return cleaned
+
+        raise ValueError("Must be 'ALL' or list of strings")
+
