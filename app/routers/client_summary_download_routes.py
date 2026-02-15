@@ -2,25 +2,30 @@
 from fastapi import APIRouter, Depends, Body, HTTPException
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
+from pydantic import BaseModel
+from typing import List, Optional, Union
 
 from db import get_db
 from utils.dependencies import get_current_user
-from services.client_summary_service import client_summary_service
 from services.client_summary_download_service import client_summary_download_service
+from schemas.dashboardschema import ClientSummaryRequest
+
+
 
 router = APIRouter(
     prefix="/client-summary",
-   
 )
+
+
 @router.post("/download")
 def download_client_summary_excel(
-    payload: dict = Body(
+    payload: ClientSummaryRequest = Body(
         ...,
         example={
             "years": [2025, 2026],
             "months": [1, 2, 3],
-            "clients": "ALL",
-            "departments": "ALL",
+            "clients": ["Client A", "Client B"],   
+            "departments": ["ALL"],
             "emp_id": ["IN01804611"],
             "client_partner": ["John Doe"],
             "shifts": "ALL",
@@ -34,12 +39,12 @@ def download_client_summary_excel(
 ):
     """
     Generate and download the client summary Excel report.
-
-    Filters are passed to client_summary_service (via the download service).
-    Returns a FileResponse with the generated Excel file.
     """
     try:
-        file_path = client_summary_download_service(db=db, payload=payload)
+        file_path = client_summary_download_service(
+            db=db,
+            payload=payload.dict(exclude_none=True)
+        )
         return FileResponse(
             path=file_path,
             filename="client_summary.xlsx",

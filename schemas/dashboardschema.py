@@ -71,19 +71,40 @@ class DashboardFilterRequest(BaseModel):
     """
     model_config = ConfigDict(extra="forbid")
 
-    clients: Union[Literal["ALL"], str, List[str]] = "ALL"
-    departments: Union[Literal["ALL"], str, List[str]] = "ALL"
+    clients: Union[Literal["ALL"], List[str]] = "ALL"
+    departments: Union[Literal["ALL"], List[str]] = "ALL"
 
     years: Optional[List[int]] = None
     months: Optional[List[int]] = None
 
-    headcounts: Union[Literal["ALL"], str, List[str]] = "ALL"
-    shifts: Union[Literal["ALL"], str, List[str]] = "ALL"
+    headcounts: Union[Literal["ALL"], List[str]] = "ALL"
+    shifts: Union[Literal["ALL"], List[str]] = "ALL"
 
     top: str = Field(default="ALL")
 
     sort_by: Optional[SortBy] = "total_allowance"
     sort_order: SortOrder = "default"
+
+    @field_validator("clients", "departments", mode="before")
+    def normalize_list_fields(cls, v):
+        """
+        Accept:
+        - "ALL"
+        - comma separated string
+        - list
+        """
+        if v == "ALL" or v is None:
+            return "ALL"
+
+        if isinstance(v, str):
+            items = [x.strip() for x in v.split(",") if x.strip()]
+            return items or "ALL"
+
+        if isinstance(v, list):
+            cleaned = [str(x).strip() for x in v if str(x).strip()]
+            return cleaned or "ALL"
+
+        return "ALL"
 
     @field_validator("top")
     def validate_top(cls, v: str):
@@ -93,23 +114,21 @@ class DashboardFilterRequest(BaseModel):
             raise ValueError("top must be 'ALL' or positive number string")
         return v
 
-    @field_validator("headcounts")
-    def normalize_headcounts(cls, v):
-        if v == "ALL":
-            return v
-        if isinstance(v, str):
-            v = [v]
-        normalized = [str(x).strip() for x in v if str(x).strip()]
-        return normalized or "ALL"
+    @field_validator("headcounts", "shifts", mode="before")
+    def normalize_multi_fields(cls, v):
+        if v == "ALL" or v is None:
+            return "ALL"
 
-    @field_validator("shifts")
-    def normalize_shifts(cls, v):
-        if v == "ALL":
-            return v
         if isinstance(v, str):
-            v = [v]
-        normalized = [str(x).strip().upper() for x in v if str(x).strip()]
-        return normalized or "ALL"
+            items = [x.strip().upper() for x in v.split(",") if x.strip()]
+            return items or "ALL"
+
+        if isinstance(v, list):
+            cleaned = [str(x).strip().upper() for x in v if str(x).strip()]
+            return cleaned or "ALL"
+
+        return "ALL"
+
 
 
 class ClientAnalyticsRequest(BaseModel):
@@ -179,3 +198,14 @@ class DashboardFilter(BaseModel):
     sort_by: Literal["total_allowance", "client", "client_partner", "headcount", "departments"] = "total_allowance"
     sort_order: Literal["asc", "desc", "default"] = "default"
 
+class ClientSummaryRequest(BaseModel):
+    years: Optional[List[int]] = None
+    months: Optional[List[int]] = None
+    clients: Optional[List[str]] = None
+    departments: Optional[List[str]] = None
+    emp_id: Optional[List[str]] = None
+    client_partner: Optional[List[str]] = None
+    shifts: Optional[Union[List[str], str]] = None
+    headcounts: Optional[str] = None
+    sort_by: Optional[str] = None
+    sort_order: Optional[str] = None

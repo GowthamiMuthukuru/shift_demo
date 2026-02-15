@@ -45,6 +45,22 @@ def _shift_header(key: str) -> str:
     return get_shift_string(key) or key
 
 
+
+def normalize_all_list(value):
+    if value is None:
+        return None
+    if isinstance(value, list):
+        if len(value) == 1 and str(value[0]).strip().upper() == "ALL":
+            return "ALL"
+        return value
+    if isinstance(value, str):
+        if value.strip().upper() == "ALL":
+            return "ALL"
+        return [value]
+    return value
+
+
+
 def _money(v: Any) -> float:
     """Coerce to float for numeric excel formatting."""
     try:
@@ -345,7 +361,6 @@ def _requested_periods_from_payload(payload: dict) -> List[str]:
 
     return periods
 
-
 def client_summary_download_service(db: Session, payload: dict) -> str:
     """
     Generate and export client summary Excel with a simplified caching strategy.
@@ -355,26 +370,31 @@ def client_summary_download_service(db: Session, payload: dict) -> str:
     - If some requested periods have no data, we do NOT throw; we add a 'Notes' sheet listing them.
     - If no data at all for requested selection, we write a Notes-only Excel instead of raising.
     """
+
     payload = (payload or {})
+
+    
+    payload["clients"] = normalize_all_list(payload.get("clients"))
+    payload["departments"] = normalize_all_list(payload.get("departments"))
+
     default_req = is_default_latest_month_request(payload)
 
+    # Sort months & years ascending
     if isinstance(payload.get("months"), list) and payload["months"]:
         payload["months"] = sorted({int(m) for m in payload["months"]})
     if isinstance(payload.get("years"), list) and payload["years"]:
         payload["years"] = sorted({int(y) for y in payload["years"]})
-    
 
-    # Build requested periods list for later comparison (partial/no-data messaging)
+    # Build requested periods list for later comparison
     requested_periods = _requested_periods_from_payload(payload)
 
-    # For default requests, we validate cache freshness against the DB latest month
+    # For default requests, validate cache freshness
     latest_ym = _get_db_latest_ym(db) if default_req else None
     shift_sig = _current_shift_signature() if default_req else None
 
     cache_key = _stable_cache_key(payload, default_req, shift_sig)
     final_default_path = os.path.join(EXPORT_DIR, DEFAULT_EXPORT_FILE)
 
-    # Try cache first
     cached = cache.get(cache_key)
     if cached:
         cached_path = cached.get("file_path")
@@ -395,18 +415,20 @@ def client_summary_download_service(db: Session, payload: dict) -> str:
             if cached_path and os.path.exists(cached_path):
                 return cached_path
 
-    # Fetch summary data; do NOT fail hard for explicit selection
     notes_lines: List[str] = []
+
     try:
         summary_data = client_summary_service(db, payload)
     except HTTPException as e:
-        # If explicit month/year selection yielded no data, write Notes-only Excel
         if e.status_code == 404 and (payload.get("months") or payload.get("years")):
             notes_lines.append("No data present for the selected month(s)/year(s).")
-            # Write a notes-only Excel and return
+
             empty_df = pd.DataFrame()
+
             if default_req:
-                written_path = _atomic_write_excel(empty_df, [], final_default_path, notes_lines=notes_lines)
+                written_path = _atomic_write_excel(
+                    empty_df, [], final_default_path, notes_lines=notes_lines
+                )
                 cache.set(
                     cache_key,
                     {
@@ -421,42 +443,52 @@ def client_summary_download_service(db: Session, payload: dict) -> str:
                 hashed_name = cache_key.split(":", 1)[-1]
                 if not hashed_name.endswith(".xlsx"):
                     hashed_name += ".xlsx"
+
                 path = os.path.join(EXPORT_DIR, hashed_name)
-                written_path = _atomic_write_excel(empty_df, [], path, notes_lines=notes_lines)
+                written_path = _atomic_write_excel(
+                    empty_df, [], path, notes_lines=notes_lines
+                )
                 cache.set(
                     cache_key,
                     {"file_path": written_path},
                     expire=CACHE_TTL,
                 )
                 return written_path
-        # Otherwise bubble up (e.g., default/latest mode no data)
+
         raise
 
-    # Optional row-level filters
+   
     emp_ids_filter = _normalize_multi_str_or_list(payload.get("emp_id"))
     partner_filter = _normalize_multi_str_or_list(payload.get("client_partner"))
 
-    # Build DF
-    df, shift_cols = _build_dataframe_from_summary(summary_data, emp_ids_filter, partner_filter)
+    
+    df, shift_cols = _build_dataframe_from_summary(
+        summary_data,
+        emp_ids_filter,
+        partner_filter,
+    )
+
     currency_cols = shift_cols + ["Total Allowance"]
 
-    # If explicit selection and we have some data, compute partial-missing periods and note them
+   
     if requested_periods:
         present_periods = set(summary_data.keys())
         missing_periods = [p for p in requested_periods if p not in present_periods]
         if missing_periods:
-            # We add a Notes sheet instead of raising errors
             pretty_missing = ", ".join(missing_periods)
-            notes_lines.append(f"No data present for the following selected period(s): {pretty_missing}")
+            notes_lines.append(
+                f"No data present for the following selected period(s): {pretty_missing}"
+            )
 
-    # If DF is empty (e.g., filters removed all rows), write Notes-only Excel
+   
     if df is None or df.empty:
         if not notes_lines:
-            # Keep a friendly message even if no explicit selection
             notes_lines.append("No data present.")
-        # Write notes-only Excel
+
         if default_req:
-            written_path = _atomic_write_excel(pd.DataFrame(), [], final_default_path, notes_lines=notes_lines)
+            written_path = _atomic_write_excel(
+                pd.DataFrame(), [], final_default_path, notes_lines=notes_lines
+            )
             cache.set(
                 cache_key,
                 {
@@ -471,8 +503,11 @@ def client_summary_download_service(db: Session, payload: dict) -> str:
             hashed_name = cache_key.split(":", 1)[-1]
             if not hashed_name.endswith(".xlsx"):
                 hashed_name += ".xlsx"
+
             path = os.path.join(EXPORT_DIR, hashed_name)
-            written_path = _atomic_write_excel(pd.DataFrame(), [], path, notes_lines=notes_lines)
+            written_path = _atomic_write_excel(
+                pd.DataFrame(), [], path, notes_lines=notes_lines
+            )
             cache.set(
                 cache_key,
                 {"file_path": written_path},
@@ -480,9 +515,10 @@ def client_summary_download_service(db: Session, payload: dict) -> str:
             )
             return written_path
 
-    # Default requests -> stable file name
     if default_req:
-        written_path = _atomic_write_excel(df, currency_cols, final_default_path, notes_lines=notes_lines)
+        written_path = _atomic_write_excel(
+            df, currency_cols, final_default_path, notes_lines=notes_lines
+        )
         cache.set(
             cache_key,
             {
@@ -494,16 +530,20 @@ def client_summary_download_service(db: Session, payload: dict) -> str:
         )
         return written_path
 
-    # Non-default -> hashed filename
     hashed_name = cache_key.split(":", 1)[-1]
     if not hashed_name.endswith(".xlsx"):
         hashed_name += ".xlsx"
+
     path = os.path.join(EXPORT_DIR, hashed_name)
 
-    written_path = _atomic_write_excel(df, currency_cols, path, notes_lines=notes_lines)
+    written_path = _atomic_write_excel(
+        df, currency_cols, path, notes_lines=notes_lines
+    )
+
     cache.set(
         cache_key,
         {"file_path": written_path},
         expire=CACHE_TTL,
     )
+
     return written_path
