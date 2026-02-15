@@ -76,21 +76,34 @@ def _current_shift_signature() -> Tuple[str, ...]:
 def _normalize_multi_str_or_list(value: Any) -> Optional[Set[str]]:
     """
     Normalize payload values that can be 'ALL', string, or list -> set[str].
-    - Returns None when no filter should be applied ('ALL', None, []).
-    - Keeps original case (exact matching) to avoid accidental mismatches.
+    Returns None when no filter should be applied ('ALL', None, []).
+
+    DEBUG-ENABLED: prints the input and resulting filter.
     """
     if value is None:
+        print("DEBUG: Filter value is None -> no filter applied")
         return None
+
     if isinstance(value, str):
         if value.strip().upper() == "ALL":
+            print("DEBUG: Filter value is 'ALL' -> no filter applied")
             return None
         parts = [p.strip() for p in value.split(",") if p.strip()]
-        return set(parts) if parts else None
+        result = set(parts) if parts else None
+        print(f"DEBUG: Normalized string filter: {result}")
+        return result
+
     if isinstance(value, list):
         parts = [str(p).strip() for p in value if str(p).strip()]
         if len(parts) == 1 and parts[0].upper() == "ALL":
+            print("DEBUG: List filter contains only 'ALL' -> no filter applied")
             return None
-        return set(parts) if parts else None
+        result = set(parts) if parts else None
+        print(f"DEBUG: Normalized list filter: {result}")
+        return result
+
+    # Fallback
+    print(f"DEBUG: Unknown filter type {type(value)} -> no filter applied")
     return None
 
 
@@ -195,7 +208,6 @@ def _atomic_write_excel(
             except Exception:
                 pass
 
-
 def _build_dataframe_from_summary(
     summary_data: Dict[str, Any],
     emp_ids_filter: Optional[Set[str]],
@@ -203,23 +215,20 @@ def _build_dataframe_from_summary(
 ) -> Tuple[pd.DataFrame, List[str]]:
     """
     Build the export DataFrame and return (df, shift_cols).
-    Filters are applied at row-build time:
-      - emp_ids_filter: optional set of employee IDs
-      - partner_filter: optional set of client partner names
+    DEBUG version: prints why rows are skipped.
     """
     shift_keys = [k.upper().strip() for k in get_all_shift_keys()]
     shift_cols = [get_shift_string(k) or k for k in shift_keys]
 
     rows: List[Dict[str, Any]] = []
 
-    # Iterate periods in ascending order
     for period_key in sorted(summary_data):
         period_data = summary_data[period_key]
         clients = period_data.get("clients")
         if not clients:
+            print(f"DEBUG: No clients found for period {period_key}")
             continue
 
-        # clients is a dict keyed by client_name -> client_block
         for client_name, client_block in clients.items():
             partner_value = client_block.get("client_partner", "")
             departments = client_block.get("departments", {})
@@ -227,9 +236,10 @@ def _build_dataframe_from_summary(
             for dept_name, dept_block in departments.items():
                 employees = dept_block.get("employees", [])
 
-                # If no employees (unlikely but supported), write a dept-only row
+                # Dept-only row when no employees
                 if not employees:
                     if partner_filter and partner_value not in partner_filter:
+                        print(f"DEBUG: Dept '{dept_name}' skipped due to partner filter")
                         continue
 
                     row = {
@@ -240,7 +250,6 @@ def _build_dataframe_from_summary(
                         "Department": dept_name,
                         "Head Count": int(dept_block.get("dept_head_count", 0) or 0),
                     }
-                    # Dept totals from plain keys
                     for k, col in zip(shift_keys, shift_cols):
                         row[col] = _money(dept_block.get(k, 0))
                     row["Total Allowance"] = _money(dept_block.get("dept_total", 0))
@@ -251,10 +260,12 @@ def _build_dataframe_from_summary(
                 for emp in employees:
                     emp_id_val = emp.get("emp_id", "")
                     if emp_ids_filter and emp_id_val not in emp_ids_filter:
+                        print(f"DEBUG: Employee '{emp_id_val}' skipped due to emp_id filter")
                         continue
 
                     emp_partner = emp.get("client_partner", partner_value)
                     if partner_filter and emp_partner not in partner_filter:
+                        print(f"DEBUG: Employee '{emp_id_val}' skipped due to partner filter")
                         continue
 
                     row = {
@@ -265,17 +276,14 @@ def _build_dataframe_from_summary(
                         "Department": dept_name,
                         "Head Count": 1,
                     }
-                    # Employee shifts with dept fallback (plain keys)
                     for k, col in zip(shift_keys, shift_cols):
                         row[col] = _money(emp.get(k, dept_block.get(k, 0)))
                     row["Total Allowance"] = _money(emp.get("total", dept_block.get("dept_total", 0)))
                     rows.append(row)
 
-    
     df = pd.DataFrame(rows)
 
     if not df.empty:
-        # Sort period chronologically
         df["Period"] = pd.to_datetime(df["Period"], format="%Y-%m", errors="coerce")
         df = df.sort_values(by=["Period", "Client", "Department", "Employee ID"])
         df["Period"] = df["Period"].dt.strftime("%Y-%m")
@@ -283,11 +291,13 @@ def _build_dataframe_from_summary(
     ordered_cols = (
         ["Period", "Client", "Client Partner", "Employee ID", "Department", "Head Count"]
     ) + shift_cols + ["Total Allowance"]
-    # Keep only columns that exist (defensive)
+
     if not df.empty:
         df = df[[c for c in ordered_cols if c in df.columns]]
 
+    print(f"DEBUG: Built DataFrame with {len(df)} rows")
     return df, shift_cols
+
 
 
 def _payload_hash(payload: dict) -> str:
