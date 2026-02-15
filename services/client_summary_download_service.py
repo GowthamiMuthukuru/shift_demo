@@ -33,7 +33,7 @@ from services.client_summary_service import (
 )
 from models.models import ShiftAllowances
 
-# Disk cache shared with summary service
+
 cache = Cache("./diskcache/latest_month")
 
 EXPORT_DIR = "exports"
@@ -94,61 +94,86 @@ def _normalize_multi_str_or_list(value: Any) -> Optional[Set[str]]:
     return None
 
 
-def _write_excel_to_path(df: pd.DataFrame, currency_cols: List[str], file_path: str) -> None:
+def _write_excel_to_path(
+    df: pd.DataFrame,
+    currency_cols: List[str],
+    file_path: str,
+    notes_lines: Optional[List[str]] = None,
+) -> None:
     """
     Write DataFrame to a specific path with styles; atomic write is handled by the caller.
+    Adds a 'Notes' worksheet when notes_lines are provided.
     """
     os.makedirs(os.path.dirname(file_path) or ".", exist_ok=True)
 
     with pd.ExcelWriter(file_path, engine="xlsxwriter") as writer:
-        df.to_excel(writer, index=False, sheet_name="Client Summary")
-
         workbook = writer.book
-        ws = writer.sheets["Client Summary"]
 
-        header_fmt = workbook.add_format({
-            "text_wrap": True,
-            "align": "center",
-            "valign": "vcenter",
-            "bold": True,
-            "border": 1,
-            "bg_color": "#EDEDED",
-        })
+        # If DF has rows, write main sheet
+        if df is not None and not df.empty:
+            df.to_excel(writer, index=False, sheet_name="Client Summary")
+            ws = writer.sheets["Client Summary"]
 
-        center_fmt = workbook.add_format({
-            "align": "center",
-            "valign": "vcenter",
-            "border": 1,
-        })
+            header_fmt = workbook.add_format({
+                "text_wrap": True,
+                "align": "center",
+                "valign": "vcenter",
+                "bold": True,
+                "border": 1,
+                "bg_color": "#EDEDED",
+            })
 
-        inr_fmt = workbook.add_format({
-            "align": "center",
-            "valign": "vcenter",
-            "border": 1,
-            "num_format": "₹ #,##0",
-        })
+            center_fmt = workbook.add_format({
+                "align": "center",
+                "valign": "vcenter",
+                "border": 1,
+            })
 
-        # Write header explicitly to apply header format
-        for c, col_name in enumerate(df.columns):
-            ws.write(0, c, col_name, header_fmt)
+            inr_fmt = workbook.add_format({
+                "align": "center",
+                "valign": "vcenter",
+                "border": 1,
+                "num_format": "₹ #,##0",
+            })
 
-        ws.set_row(0, 60)
-        ws.freeze_panes(1, 0)
+            # Write header explicitly to apply header format
+            for c, col_name in enumerate(df.columns):
+                ws.write(0, c, col_name, header_fmt)
 
-        currency_set = set(currency_cols)
+            ws.set_row(0, 60)
+            ws.freeze_panes(1, 0)
 
-        # Autosize columns with basic heuristics
-        for c, col_name in enumerate(df.columns):
-            lines = str(col_name).split("\n")
-            longest = max((len(x) for x in lines), default=len(str(col_name)))
-            width = min(max(longest + 2, 12), 45)
-            if col_name in ("Client", "Client Partner", "Department"):
-                width = max(width, 18)
-            fmt = inr_fmt if col_name in currency_set else center_fmt
-            ws.set_column(c, c, width, fmt)
+            currency_set = set(currency_cols)
+
+            # Autosize columns with basic heuristics
+            for c, col_name in enumerate(df.columns):
+                lines = str(col_name).split("\n")
+                longest = max((len(x) for x in lines), default=len(str(col_name)))
+                width = min(max(longest + 2, 12), 45)
+                if col_name in ("Client", "Client Partner", "Department"):
+                    width = max(width, 18)
+                fmt = inr_fmt if col_name in currency_set else center_fmt
+                ws.set_column(c, c, width, fmt)
+
+        # Add Notes sheet if requested
+        if notes_lines:
+            ws_notes = workbook.add_worksheet("Notes")
+            text_fmt = workbook.add_format({
+                "text_wrap": True,
+                "align": "left",
+                "valign": "top",
+            })
+            ws_notes.set_column(0, 0, 120)
+            for idx, line in enumerate(notes_lines):
+                ws_notes.write(idx, 0, line, text_fmt)
 
 
-def _atomic_write_excel(df: pd.DataFrame, currency_cols: List[str], final_path: str) -> str:
+def _atomic_write_excel(
+    df: pd.DataFrame,
+    currency_cols: List[str],
+    final_path: str,
+    notes_lines: Optional[List[str]] = None,
+) -> str:
     """
     Write to a temp file and atomically move into place.
     """
@@ -160,7 +185,7 @@ def _atomic_write_excel(df: pd.DataFrame, currency_cols: List[str], final_path: 
     )
     os.close(fd)
     try:
-        _write_excel_to_path(df, currency_cols, temp_path)
+        _write_excel_to_path(df, currency_cols, temp_path, notes_lines=notes_lines)
         os.replace(temp_path, final_path)  # atomic on same filesystem
         return final_path
     finally:
@@ -215,7 +240,7 @@ def _build_dataframe_from_summary(
                         "Department": dept_name,
                         "Head Count": int(dept_block.get("dept_head_count", 0) or 0),
                     }
-                    # FIX: read dept totals from plain keys (not "dept_{k}")
+                    # Dept totals from plain keys
                     for k, col in zip(shift_keys, shift_cols):
                         row[col] = _money(dept_block.get(k, 0))
                     row["Total Allowance"] = _money(dept_block.get("dept_total", 0))
@@ -240,26 +265,27 @@ def _build_dataframe_from_summary(
                         "Department": dept_name,
                         "Head Count": 1,
                     }
-                    # FIX: fallback to dept shift totals using plain keys
+                    # Employee shifts with dept fallback (plain keys)
                     for k, col in zip(shift_keys, shift_cols):
                         row[col] = _money(emp.get(k, dept_block.get(k, 0)))
                     row["Total Allowance"] = _money(emp.get("total", dept_block.get("dept_total", 0)))
                     rows.append(row)
 
-    if not rows:
-        raise HTTPException(404, "No data available for export")
-
+    
     df = pd.DataFrame(rows)
-    # Sort period chronologically
-    df["Period"] = pd.to_datetime(df["Period"], format="%Y-%m", errors="coerce")
-    df = df.sort_values(by=["Period", "Client", "Department", "Employee ID"])
-    df["Period"] = df["Period"].dt.strftime("%Y-%m")
+
+    if not df.empty:
+        # Sort period chronologically
+        df["Period"] = pd.to_datetime(df["Period"], format="%Y-%m", errors="coerce")
+        df = df.sort_values(by=["Period", "Client", "Department", "Employee ID"])
+        df["Period"] = df["Period"].dt.strftime("%Y-%m")
 
     ordered_cols = (
         ["Period", "Client", "Client Partner", "Employee ID", "Department", "Head Count"]
     ) + shift_cols + ["Total Allowance"]
     # Keep only columns that exist (defensive)
-    df = df[[c for c in ordered_cols if c in df.columns]]
+    if not df.empty:
+        df = df[[c for c in ordered_cols if c in df.columns]]
 
     return df, shift_cols
 
@@ -281,16 +307,55 @@ def _stable_cache_key(payload: dict, default_req: bool, shift_sig: Optional[Tupl
     return f"client_summary:{_payload_hash(payload)}.xlsx"
 
 
+def _requested_periods_from_payload(payload: dict) -> List[str]:
+    """
+    Build the list of requested period strings ('YYYY-MM') from the payload:
+    - If both years and months provided -> Cartesian product.
+    - If only years -> all 12 months for those years.
+    - If only months -> months in current year.
+    - If neither -> return empty list (means default/latest mode).
+    Assumes months/years already normalized to ascending and deduped.
+    """
+    years = payload.get("years") or []
+    months = payload.get("months") or []
+    periods: List[str] = []
+
+    if years and months:
+        for y in years:
+            for m in months:
+                periods.append(f"{int(y):04d}-{int(m):02d}")
+    elif years:
+        for y in years:
+            for m in range(1, 13):
+                periods.append(f"{int(y):04d}-{m:02d}")
+    elif months:
+        current_year = pd.Timestamp.today().year
+        for m in months:
+            periods.append(f"{int(current_year):04d}-{int(m):02d}")
+
+    return periods
+
+
 def client_summary_download_service(db: Session, payload: dict) -> str:
     """
     Generate and export client summary Excel with a simplified caching strategy.
 
-    NOTE:
-    - Filtering logic is delegated to `client_summary_service(db, payload)`.
-    - This service focuses on: caching, Excel rendering, and atomic writes.
+    Enhancements in this version:
+    - SORTING ONLY for months/years (ascending).
+    - If some requested periods have no data, we do NOT throw; we add a 'Notes' sheet listing them.
+    - If no data at all for requested selection, we write a Notes-only Excel instead of raising.
     """
     payload = (payload or {})
     default_req = is_default_latest_month_request(payload)
+
+    if isinstance(payload.get("months"), list) and payload["months"]:
+        payload["months"] = sorted({int(m) for m in payload["months"]})
+    if isinstance(payload.get("years"), list) and payload["years"]:
+        payload["years"] = sorted({int(y) for y in payload["years"]})
+    
+
+    # Build requested periods list for later comparison (partial/no-data messaging)
+    requested_periods = _requested_periods_from_payload(payload)
 
     # For default requests, we validate cache freshness against the DB latest month
     latest_ym = _get_db_latest_ym(db) if default_req else None
@@ -320,21 +385,94 @@ def client_summary_download_service(db: Session, payload: dict) -> str:
             if cached_path and os.path.exists(cached_path):
                 return cached_path
 
-    # Build summary data
-    summary_data = client_summary_service(db, payload)
-    if not summary_data:
-        raise HTTPException(404, "No data available")
+    # Fetch summary data; do NOT fail hard for explicit selection
+    notes_lines: List[str] = []
+    try:
+        summary_data = client_summary_service(db, payload)
+    except HTTPException as e:
+        # If explicit month/year selection yielded no data, write Notes-only Excel
+        if e.status_code == 404 and (payload.get("months") or payload.get("years")):
+            notes_lines.append("No data present for the selected month(s)/year(s).")
+            # Write a notes-only Excel and return
+            empty_df = pd.DataFrame()
+            if default_req:
+                written_path = _atomic_write_excel(empty_df, [], final_default_path, notes_lines=notes_lines)
+                cache.set(
+                    cache_key,
+                    {
+                        "_cached_month": latest_ym,
+                        "file_path": written_path,
+                        "shift_sig": shift_sig,
+                    },
+                    expire=CACHE_TTL,
+                )
+                return written_path
+            else:
+                hashed_name = cache_key.split(":", 1)[-1]
+                if not hashed_name.endswith(".xlsx"):
+                    hashed_name += ".xlsx"
+                path = os.path.join(EXPORT_DIR, hashed_name)
+                written_path = _atomic_write_excel(empty_df, [], path, notes_lines=notes_lines)
+                cache.set(
+                    cache_key,
+                    {"file_path": written_path},
+                    expire=CACHE_TTL,
+                )
+                return written_path
+        # Otherwise bubble up (e.g., default/latest mode no data)
+        raise
 
     # Optional row-level filters
     emp_ids_filter = _normalize_multi_str_or_list(payload.get("emp_id"))
     partner_filter = _normalize_multi_str_or_list(payload.get("client_partner"))
 
+    # Build DF
     df, shift_cols = _build_dataframe_from_summary(summary_data, emp_ids_filter, partner_filter)
     currency_cols = shift_cols + ["Total Allowance"]
 
+    # If explicit selection and we have some data, compute partial-missing periods and note them
+    if requested_periods:
+        present_periods = set(summary_data.keys())
+        missing_periods = [p for p in requested_periods if p not in present_periods]
+        if missing_periods:
+            # We add a Notes sheet instead of raising errors
+            pretty_missing = ", ".join(missing_periods)
+            notes_lines.append(f"No data present for the following selected period(s): {pretty_missing}")
+
+    # If DF is empty (e.g., filters removed all rows), write Notes-only Excel
+    if df is None or df.empty:
+        if not notes_lines:
+            # Keep a friendly message even if no explicit selection
+            notes_lines.append("No data present.")
+        # Write notes-only Excel
+        if default_req:
+            written_path = _atomic_write_excel(pd.DataFrame(), [], final_default_path, notes_lines=notes_lines)
+            cache.set(
+                cache_key,
+                {
+                    "_cached_month": latest_ym,
+                    "file_path": written_path,
+                    "shift_sig": shift_sig,
+                },
+                expire=CACHE_TTL,
+            )
+            return written_path
+        else:
+            hashed_name = cache_key.split(":", 1)[-1]
+            if not hashed_name.endswith(".xlsx"):
+                hashed_name += ".xlsx"
+            path = os.path.join(EXPORT_DIR, hashed_name)
+            written_path = _atomic_write_excel(pd.DataFrame(), [], path, notes_lines=notes_lines)
+            cache.set(
+                cache_key,
+                {"file_path": written_path},
+                expire=CACHE_TTL,
+            )
+            return written_path
+
     # Default requests -> stable file name
     if default_req:
-        written_path = _atomic_write_excel(df, currency_cols, final_default_path)
+        written_path = _atomic_write_excel(df, currency_cols, final_default_path, notes_lines=notes_lines)
         cache.set(
             cache_key,
             {
@@ -352,7 +490,7 @@ def client_summary_download_service(db: Session, payload: dict) -> str:
         hashed_name += ".xlsx"
     path = os.path.join(EXPORT_DIR, hashed_name)
 
-    written_path = _atomic_write_excel(df, currency_cols, path)
+    written_path = _atomic_write_excel(df, currency_cols, path, notes_lines=notes_lines)
     cache.set(
         cache_key,
         {"file_path": written_path},

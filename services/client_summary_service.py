@@ -6,23 +6,31 @@ Features:
 - Headcount range applied at dept level if departments selected, else at client level.
 - Validations for years, months, shifts, and headcount formats.
 - Caching for latest-month requests and month resolution with filter-aware keys.
+
+Behavior:
+- Sorting: user-selected years/months are converted to int, deduped, and sorted ascending.
+- If some of the explicitly selected periods have no data -> no error; response.meta.missing_periods is populated.
+- If none of the explicitly selected periods have data -> no error; return empty "periods" + message in meta.
+- If default/latest mode and no data -> no error; return empty "periods" + message in meta.
 """
 
 from __future__ import annotations
-from datetime import date, datetime
+from datetime import date
 from typing import List, Dict, Optional, Any, Tuple
+
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
 from sqlalchemy import func, and_, or_, cast, Integer, extract
+
 from models.models import ShiftAllowances, ShiftMapping, ShiftsAmount
 from diskcache import Cache
 from utils.shift_config import get_all_shift_keys
-
 
 cache = Cache("./diskcache/latest_month")
 
 CLIENT_SUMMARY_VERSION = "v3"
 CACHE_TTL = 24 * 60 * 60  # 24 hours
+
 
 def clean_str(value: Any) -> str:
     """Normalize strings from DB and inputs."""
@@ -30,7 +38,6 @@ def clean_str(value: Any) -> str:
         return ""
     s = value.strip() if isinstance(value, str) else str(value).strip()
     s = s.replace("\u200b", "").replace("\u00a0", "").strip()
-   
     for _ in range(2):
         if len(s) >= 2 and ((s[0] == s[-1]) and s[0] in ("'", '"')):
             s = s[1:-1].strip()
@@ -114,7 +121,7 @@ def parse_headcount_ranges(headcounts_payload):
                     status_code=400,
                     detail=f"Invalid headcount range: {h}"
                 )
-        elif h.isdigit():
+        elif str(h).isdigit():
             start = end = int(h)
         else:
             raise HTTPException(
@@ -149,6 +156,7 @@ def build_base_query(db: Session):
             ),
         )
     )
+
 
 
 def prev_month(d: date) -> date:
@@ -199,9 +207,8 @@ def has_data_for_month(
 
     # emp_id filter
     if emp_id:
-        if isinstance(emp_id, str):
-            emp_id = [emp_id]
-        q = q.filter(func.lower(ShiftAllowances.emp_id).in_([clean_str(e).lower() for e in emp_id]))
+        ids = emp_id if isinstance(emp_id, list) else [emp_id]
+        q = q.filter(func.lower(ShiftAllowances.emp_id).in_([clean_str(e).lower() for e in ids]))
 
     # client_partner filter
     if client_partner:
@@ -209,9 +216,7 @@ def has_data_for_month(
         if isinstance(client_partner, list):
             parts = [clean_str(cp) for cp in client_partner if clean_str(cp)]
             if parts:
-                q = q.filter(
-                    or_(*[func.lower(col).like(f"%{p.lower()}%") for p in parts])
-                )
+                q = q.filter(or_(*[func.lower(col).like(f"%{p.lower()}%") for p in parts]))
         else:
             q = q.filter(func.lower(col).like(f"%{clean_str(client_partner).lower()}%"))
 
@@ -238,6 +243,35 @@ def latest_month_cache_key(payload: dict) -> str:
     return f"client_summary_latest:{CLIENT_SUMMARY_VERSION}:{str(parts)}"
 
 
+def _requested_periods_from_payload(payload: dict) -> List[str]:
+    """
+    Build a list of requested 'YYYY-MM' periods from the payload, sorted ascending.
+    - Both years & months -> Cartesian product.
+    - Years only -> all 12 months for those years.
+    - Months only -> current year.
+    - Neither -> empty list (default/latest mode).
+    """
+    years_raw = payload.get("years") or []
+    months_raw = payload.get("months") or []
+    years = sorted({int(y) for y in years_raw}) if years_raw else []
+    months = sorted({int(m) for m in months_raw}) if months_raw else []
+
+    periods: List[str] = []
+    if years and months:
+        for y in years:
+            for m in months:
+                periods.append(f"{int(y):04d}-{int(m):02d}")
+    elif years:
+        for y in years:
+            for m in range(1, 13):
+                periods.append(f"{int(y):04d}-{m:02d}")
+    elif months:
+        current_year = date.today().year
+        for m in months:
+            periods.append(f"{int(current_year):04d}-{int(m):02d}")
+    return periods
+
+
 def resolve_target_months_with_fallback(
     db: Session,
     payload: dict,
@@ -251,18 +285,18 @@ def resolve_target_months_with_fallback(
     """
     Month determination logic:
 
-    - Years & Months both -> Cartesian product (all combinations, sorted ascending, deduped).
-    - Years only -> all 12 months in those years (sorted).
-    - Months only -> assume current year (sorted).
+    - Years & Months both -> Cartesian product (ascending).
+    - Years only -> all 12 months in those years (ascending).
+    - Months only -> assume current year (ascending).
     - Neither -> try current month; if no data, walk backward up to `max_lookback_months`;
       else fallback to absolute latest month in DB; else current month if DB empty.
     """
     selected_years_raw = payload.get("years", [])
     selected_months_raw = payload.get("months", [])
 
-    # Normalize and validate once
-    selected_years = [int(y) for y in selected_years_raw] if selected_years_raw else []
-    selected_months = [int(m) for m in selected_months_raw] if selected_months_raw else []
+    # SORTING ONLY: convert to int, remove duplicates, sort ascending
+    selected_years = sorted({int(y) for y in selected_years_raw}) if selected_years_raw else []
+    selected_months = sorted({int(m) for m in selected_months_raw}) if selected_months_raw else []
 
     # Validate
     if selected_years:
@@ -271,36 +305,18 @@ def resolve_target_months_with_fallback(
     if selected_months:
         validate_months(selected_months)
 
-    # Deduplicate and sort for deterministic output
-    selected_years = sorted(set(selected_years))
-    selected_months = sorted(set(selected_months))
-
-    # 1) Both provided -> CARTESIAN PRODUCT
+    # 1) Both provided -> CARTESIAN PRODUCT (ascending)
     if selected_years and selected_months:
-        # Build all (year, month) pairs
-        combos = []
-        for y in selected_years:
-            for m in selected_months:
-                combos.append(date(int(y), int(m), 1))
-        # Sort to ensure ascending chronological order
-        combos.sort()
-        return combos
+        return [date(int(y), int(m), 1) for y in selected_years for m in selected_months]
 
-    # 2) Only years provided -> all months of those years
+    # 2) Only years provided -> all months of those years (ascending)
     if selected_years and not selected_months:
-        months = []
-        for y in selected_years:
-            for m in range(1, 13):
-                months.append(date(int(y), m, 1))
-        months.sort()
-        return months
+        return [date(int(y), m, 1) for y in selected_years for m in range(1, 13)]
 
-    # 3) Only months provided -> current year
+    # 3) Only months provided -> current year (ascending)
     if selected_months and not selected_years:
         current_year = date.today().year
-        months = [date(current_year, int(m), 1) for m in selected_months]
-        months.sort()
-        return months
+        return [date(current_year, int(m), 1) for m in selected_months]
 
     # 4) Neither provided -> resolve latest with fallback and cache (filter-aware key)
     lm_key = latest_month_cache_key(payload)
@@ -337,10 +353,13 @@ def resolve_target_months_with_fallback(
     cache.set(lm_key, current, expire=CACHE_TTL)
     return [current]
 
+
 def client_summary_service(db: Session, payload: dict):
     """
     Return client summary with multi-year, multi-month, shift, and headcount filters with sorting.
-    Caches the final response for requests that do not explicitly pass years/months (latest-month-style).
+    For explicit month/year selections:
+      - Does NOT throw when some or all selected periods are empty.
+      - Returns "meta" with requested/present/missing periods and a friendly message when applicable.
     """
 
     payload = payload or {}
@@ -351,8 +370,13 @@ def client_summary_service(db: Session, payload: dict):
     departments_raw = payload.get("departments", "ALL")
     emp_id = payload.get("emp_id")
     client_partner = payload.get("client_partner")
-    selected_years = payload.get("years", [])
-    selected_months = payload.get("months", [])
+
+    # SORTING ONLY: read, parse, dedupe, sort ascending
+    selected_years_raw = payload.get("years", [])
+    selected_months_raw = payload.get("months", [])
+    selected_years = sorted({int(y) for y in selected_years_raw}) if selected_years_raw else []
+    selected_months = sorted({int(m) for m in selected_months_raw}) if selected_months_raw else []
+
     shifts = payload.get("shifts", "ALL")
     headcounts_payload = payload.get("headcounts", "ALL")
     sort_by = payload.get("sort_by", "total_allowance")
@@ -379,7 +403,7 @@ def client_summary_service(db: Session, payload: dict):
 
     departments_selected = bool(departments_list)
 
-    # Validate years/months
+    # Validate years/months (defensive)
     if selected_years:
         for y in selected_years:
             validate_year(int(y))
@@ -389,9 +413,8 @@ def client_summary_service(db: Session, payload: dict):
     # Normalize shifts; build allowed set for filtering
     allowed_shifts_for_filter: set = set()
     if shifts != "ALL":
-        if isinstance(shifts, str):
-            shifts = [shifts]
-        shifts_upper = [clean_str(s).upper() for s in shifts]
+        sel = [shifts] if isinstance(shifts, str) else list(shifts)
+        shifts_upper = [clean_str(s).upper() for s in sel]
         invalid_shifts = [s for s in shifts_upper if s not in shift_key_set]
         if invalid_shifts:
             raise HTTPException(400, f"Invalid shift(s): {invalid_shifts}")
@@ -405,7 +428,9 @@ def client_summary_service(db: Session, payload: dict):
     # Parse headcount ranges
     headcount_ranges = parse_headcount_ranges(headcounts_payload)
 
- 
+    # Compute requested periods (for meta & partial/no-data messages)
+    requested_periods = _requested_periods_from_payload(payload)
+
     months_to_use: List[date] = resolve_target_months_with_fallback(
         db=db,
         payload=payload,
@@ -416,7 +441,7 @@ def client_summary_service(db: Session, payload: dict):
         allowed_shifts=allowed_shifts_for_filter,
     )
 
- 
+    # Latest-style (no explicit months/years) for response caching
     latest_style_request = (not selected_years and not selected_months)
     response_cache_key = None
     if latest_style_request:
@@ -447,10 +472,9 @@ def client_summary_service(db: Session, payload: dict):
 
     # Filter emp_id
     if emp_id:
-        if isinstance(emp_id, str):
-            emp_id = [emp_id]
+        ids = [emp_id] if isinstance(emp_id, str) else emp_id
         query = query.filter(
-            func.lower(ShiftAllowances.emp_id).in_([clean_str(e).lower() for e in emp_id])
+            func.lower(ShiftAllowances.emp_id).in_([clean_str(e).lower() for e in ids])
         )
 
     # Filter client_partner
@@ -485,16 +509,18 @@ def client_summary_service(db: Session, payload: dict):
     rows = query.all()
 
     
-    response: dict = {}
+    periods_map: Dict[str, Any] = {}
+    present_periods_set = set()
 
     for dm, client, dept, eid, ename, cp, stype, days, amt in rows:
         stype_norm = clean_str(stype).upper()
         if stype_norm not in shift_key_set:
-            # Skip shifts not in the selected set (if user narrowed shifts)
             continue
 
         period_key = dm.strftime("%Y-%m")
-        month_block = response.setdefault(
+        present_periods_set.add(period_key)
+
+        month_block = periods_map.setdefault(
             period_key,
             {
                 "clients": {},
@@ -545,7 +571,6 @@ def client_summary_service(db: Session, payload: dict):
                 start <= total_headcount_for_check <= end for start, end in headcount_ranges
             )
             if not passes_headcount:
-                
                 continue
 
             employee = {
@@ -571,13 +596,13 @@ def client_summary_service(db: Session, payload: dict):
         month_block["month_total"][stype_norm] += val
         month_block["month_total"]["total_allowance"] += val
 
-  
-    for period, pdata in response.items():
+   
+    for period, pdata in periods_map.items():
         clients_map = pdata.get("clients", {})
         clients_data = list(clients_map.values())
 
         reverse = (sort_order == "desc")
-        sort_key = sort_by.lower()
+        sort_key = (sort_by or "").lower()
 
         if sort_key == "head_count":
             clients_data.sort(key=lambda x: x.get("client_head_count", 0), reverse=reverse)
@@ -589,12 +614,39 @@ def client_summary_service(db: Session, payload: dict):
             clients_data.sort(key=lambda x: len(x.get("departments", {})), reverse=reverse)
         elif sort_key == "total_allowance":
             clients_data.sort(key=lambda x: x.get("client_total", 0.0), reverse=reverse)
-       
+        # else: leave as-is
 
+        # Rebuild ordered dict keyed by client_name
         pdata["clients"] = {c["client_name"]: c for c in clients_data}
 
-    
-    if latest_style_request and response_cache_key:
-        cache.set(response_cache_key, response, expire=CACHE_TTL)
+  
+    present_periods = sorted(present_periods_set)  # ascending lex YYYY-MM
+    missing_periods: List[str] = []
+    message: Optional[str] = None
 
-    return response
+    if requested_periods:
+        missing_periods = [p for p in requested_periods if p not in present_periods]
+        if missing_periods and present_periods:
+            message = f"No data present for the following selected period(s): {', '.join(missing_periods)}"
+        elif missing_periods and not present_periods:
+            message = "No data present for the selected month(s)/year(s)."
+    else:
+        # Default/latest mode without explicit selection
+        if not present_periods:
+            message = "No data present."
+
+    final_response = {
+        "periods": periods_map,
+        "meta": {
+            "requested_periods": requested_periods,
+            "present_periods": present_periods,
+            "missing_periods": missing_periods,
+            "message": message,
+        }
+    }
+
+    # Cache the final response for latest-month-style requests
+    if latest_style_request and response_cache_key:
+        cache.set(response_cache_key, final_response, expire=CACHE_TTL)
+
+    return final_response
