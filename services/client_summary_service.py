@@ -3,7 +3,7 @@ Client summary service with multi-year, multi-month, shift, and headcount suppor
 
 Features:
 - Filters by years, months, clients, departments, employees, client partners, shifts, headcount ranges.
-- Headcount range applied at dept level if departments selected, else at client level.
+- Headcount range applied at CLIENT level (unique employees across its departments).
 - Validations for years, months, shifts, and headcount formats.
 - Caching for latest-month requests and month resolution with filter-aware keys.
 
@@ -36,7 +36,6 @@ cache = Cache("./diskcache/latest_month")
 # 🔄 Bump to invalidate caches generated under old latest-month behavior and zero-shift bug
 CLIENT_SUMMARY_VERSION = "v4"
 CACHE_TTL = 24 * 60 * 60  # 24 hours
-
 
 
 def empty_shift_totals(shift_keys: List[str]) -> Dict[str, float]:
@@ -139,8 +138,6 @@ def get_shift_keys() -> List[str]:
     return [clean_str(k).upper() for k in get_all_shift_keys()]
 
 
-
-
 def build_base_query(db: Session):
     """Base SQLAlchemy query for allowances joined to mapping and shift amounts."""
     return (
@@ -165,7 +162,6 @@ def build_base_query(db: Session):
             ),
         )
     )
-
 
 
 def _requested_periods_from_payload(payload: dict) -> List[str]:
@@ -207,6 +203,7 @@ def latest_month_cache_key(payload: dict) -> str:
         "emp_id": payload.get("emp_id"),
         "client_partner": payload.get("client_partner"),
         "shifts": payload.get("shifts", "ALL"),
+        "headcounts": payload.get("headcounts", "ALL"),  # include headcount for cache correctness
     }
     return f"client_summary_latest:{CLIENT_SUMMARY_VERSION}:{str(parts)}"
 
@@ -276,13 +273,12 @@ def resolve_target_months(
     return []
 
 
-
 def client_summary_service(db: Session, payload: dict):
     payload = payload or {}
-    shift_keys = get_shift_keys()               
+    shift_keys = get_shift_keys()
     shift_key_set = set(shift_keys)
 
-  
+   
     clients_raw = payload.get("clients", "ALL")
     if isinstance(clients_raw, str):
         clients_list = [] if clients_raw == "ALL" else [c.strip() for c in clients_raw.split(",") if c.strip()]
@@ -291,7 +287,7 @@ def client_summary_service(db: Session, payload: dict):
     else:
         clients_list = []
 
-    # --- Normalize departments ---
+
     departments_raw = payload.get("departments", "ALL")
     if isinstance(departments_raw, str):
         departments_list = [] if departments_raw == "ALL" else [departments_raw.strip()]
@@ -303,7 +299,7 @@ def client_summary_service(db: Session, payload: dict):
     emp_id = payload.get("emp_id")
     client_partner = payload.get("client_partner")
 
-    # --- Shifts filter ---
+   
     shifts = payload.get("shifts", "ALL")
     allowed_shifts_for_filter: set = set()
     if shifts != "ALL":
@@ -313,15 +309,12 @@ def client_summary_service(db: Session, payload: dict):
         if invalid_shifts:
             raise HTTPException(400, f"Invalid shift(s): {invalid_shifts}")
         allowed_shifts_for_filter = set(shifts_upper)
-        # For totals, we still keep the full set of keys to present consistent shape,
-        # but filtering ensures only selected shifts contribute values.
     else:
         allowed_shifts_for_filter = set(shift_keys)
 
-    # --- Headcount ranges ---
     headcount_ranges = parse_headcount_ranges(payload.get("headcounts", "ALL"))
 
-    # --- Determine target months ---
+  
     months_to_use: List[date] = resolve_target_months(
         db=db,
         payload=payload,
@@ -332,14 +325,14 @@ def client_summary_service(db: Session, payload: dict):
         allowed_shifts=allowed_shifts_for_filter,
     )
 
-    # If no months to use → return empty periods with message
+    # If no months to use → return empty periods with message (keep structure)
     if not months_to_use:
         return {
             "periods": {},
             "meta": {"message": "No data found for the selected filters."}
         }
 
-    # --- Caching for latest-month style requests ---
+
     latest_style_request = not payload.get("years") and not payload.get("months")
     response_cache_key = None
     if latest_style_request:
@@ -349,13 +342,14 @@ def client_summary_service(db: Session, payload: dict):
             "emp_id": payload.get("emp_id"),
             "client_partner": payload.get("client_partner"),
             "shifts": payload.get("shifts", "ALL"),
+            "headcounts": payload.get("headcounts", "ALL"),  # ensure cache is headcount-aware
         }
         response_cache_key = f"client_summary_latest:{CLIENT_SUMMARY_VERSION}:{str(parts)}:response"
         cached_resp = cache.get(response_cache_key)
         if cached_resp:
             return cached_resp
 
-    # --- Build base query ---
+  
     query = build_base_query(db)
 
     # Apply filters
@@ -436,7 +430,7 @@ def client_summary_service(db: Session, payload: dict):
         # Initialize department bucket
         if dept_name not in client_data["departments"]:
             dept_template = {
-                "dept_head_count": 0,
+                "dept_head_count": 0,  # informative (not used for filtering)
                 "dept_total": 0.0,
                 "employees": [],
                 # internal accumulator for unique employees
@@ -481,43 +475,64 @@ def client_summary_service(db: Session, payload: dict):
         dept_data[shift_key] += value
         dept_data["dept_total"] += value
 
-    # --- Finalize structure, apply headcount filtering, and rollups ---
-    def dept_matches_headcount(dept_hc: int, ranges: Optional[List[Tuple[int, int]]]) -> bool:
+
+    def range_matches(hc: int, ranges: Optional[List[Tuple[int, int]]]) -> bool:
+        """Returns True if hc falls in any of the provided ranges; None/empty means ALL."""
         if not ranges:
             return True
-        return any(start <= dept_hc <= end for start, end in ranges)
+        return any(start <= hc <= end for start, end in ranges)
 
     for month_str, month_data in aggregated.items():
+        # 1) Finalize departments: materialize employees & dept headcount (no filtering at dept level)
         for client_name, client_data in month_data["clients"].items():
-            filtered_departments: Dict[str, Any] = {}
-
-            # Finalize departments (materialize employees and headcount)
+            finalized_departments: Dict[str, Any] = {}
             for dept_name, dept_data in client_data["departments"].items():
-                # Convert emp_map to list and compute headcount
                 emp_map = dept_data.pop("_emp_map", {})
                 employees = list(emp_map.values())
                 dept_data["employees"] = employees
-                dept_data["dept_head_count"] = len(employees)
+                dept_data["dept_head_count"] = len(employees)  # informative only
+                finalized_departments[dept_name] = dept_data
 
-                # Apply headcount filter at dept level
-                if dept_matches_headcount(dept_data["dept_head_count"], headcount_ranges):
-                    filtered_departments[dept_name] = dept_data
+            client_data["departments"] = finalized_departments
 
-            # Replace with filtered
-            client_data["departments"] = filtered_departments
+        # 2) Compute client-level aggregates and filter clients by client headcount
+        filtered_clients: Dict[str, Any] = {}
+        for client_name, client_data in month_data["clients"].items():
+            depts = client_data["departments"]
 
-            # Recompute client-level rollups from filtered depts
-            client_data["client_head_count"] = sum(d["dept_head_count"] for d in filtered_departments.values())
-            client_data["client_total"] = sum(d["dept_total"] for d in filtered_departments.values())
+            # Client totals from departments
+            client_total = sum(d["dept_total"] for d in depts.values())
+            per_shift_totals = {k: sum(d[k] for d in depts.values()) for k in shift_keys}
+
+            # Client headcount = unique employees across ALL its departments
+            unique_emp_ids = set()
+            for d in depts.values():
+                for e in d.get("employees", []):
+                    eid = e.get("emp_id")
+                    if eid:
+                        unique_emp_ids.add(eid)
+            client_headcount = len(unique_emp_ids)
+
+            # Apply headcount range at CLIENT level
+            if not range_matches(client_headcount, headcount_ranges):
+                # Drop entire client if not matching the requested headcount range
+                continue
+
+            # Write back aggregates for surviving client
+            client_data["client_total"] = client_total
+            client_data["client_head_count"] = client_headcount
             for k in shift_keys:
-                client_data[k] = sum(d[k] for d in filtered_departments.values())
+                client_data[k] = per_shift_totals[k]
 
-        # Month totals from client-level aggregates
+            filtered_clients[client_name] = client_data
+
+        # Replace clients with filtered set
+        month_data["clients"] = filtered_clients
+
+        # 3) Month totals from surviving clients
         month_total = month_data["month_total"]
-        # Per-shift month totals
         for k in shift_keys:
             month_total[k] = sum(c[k] for c in month_data["clients"].values())
-        # Headcount and allowance
         month_total["total_head_count"] = sum(c["client_head_count"] for c in month_data["clients"].values())
         month_total["total_allowance"] = sum(c["client_total"] for c in month_data["clients"].values())
 
