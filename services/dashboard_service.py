@@ -706,66 +706,86 @@ def validate_shifts(payload: Any) -> None:
         if invalid:
             raise HTTPException(status_code=400, detail=f"Invalid shift type(s): {invalid}")
 
-
 def validate_headcounts(payload: Any) -> None:
+    """
+    Validate headcounts filter.
+    Accepts ONLY numeric ranges such as:
+        "1-5"
+        "10-20"
+        "5"
+    OR list of such values.
+    Does NOT support sorting words (highest-to-lowest etc).
+    """
     payload_dict = _payload_to_dict(payload)
-    value = payload_dict.get("headcounts", None)
+    value = payload_dict.get("headcounts")
 
     if value is None or _is_all(value):
         return
 
-    if not isinstance(value, list):
+    # Normalize into list
+    if isinstance(value, str):
         value = [value]
+    elif not isinstance(value, list):
+        raise HTTPException(status_code=400, detail="Invalid headcounts format.")
 
     for item in value:
-        s = _normalize_dash(clean_str(item)).upper()
-        if not s or s == "ALL":
+        s = _normalize_dash(clean_str(item))
+        if not s:
             continue
 
+        # Range:  N-M
         if "-" in s:
-            lo, hi = [x.strip() for x in s.split("-", 1)]
+            parts = [x.strip() for x in s.split("-", 1)]
+            if len(parts) != 2:
+                raise HTTPException(status_code=400, detail=f"Invalid headcount range: {item}")
+
+            lo, hi = parts
             if not lo.isdigit() or not hi.isdigit():
-                raise HTTPException(status_code=400, detail="Invalid headcount range.")
-            lo_i, hi_i = int(lo), int(hi)
-            if lo_i <= 0 or lo_i > hi_i:
-                raise HTTPException(status_code=400, detail="Invalid headcount range.")
+                raise HTTPException(status_code=400, detail=f"Invalid headcount range: {item}")
+
+            lo, hi = int(lo), int(hi)
+            if lo <= 0 or hi <= 0 or lo > hi:
+                raise HTTPException(status_code=400, detail=f"Invalid headcount range: {item}")
         else:
-            if not s.isdigit() or int(s) <= 0:
-                raise HTTPException(status_code=400, detail="Invalid headcount value.")
+            # Single integer
+            if not s.isdigit():
+                raise HTTPException(status_code=400, detail=f"Invalid headcount value: {item}")
+
+            if int(s) <= 0:
+                raise HTTPException(status_code=400, detail=f"Invalid headcount value: {item}")
 
 
-def parse_headcount_limit(value: Any) -> Optional[int]:
+
+def parse_headcount_ranges(value: Any) -> Optional[List[Tuple[int, int]]]:
     """
-    Returns numeric limit for employees.
-    If multiple ranges are selected, returns max upper bound.
+    Convert headcounts filter to list of (min,max) numeric ranges.
+    ALWAYS returns exact numeric ranges:
+        "1-5" -> [(1,5)]
+        "5"   -> [(5,5)]
     """
     if value is None or _is_all(value):
         return None
 
-    if not isinstance(value, list):
+    if isinstance(value, str):
         value = [value]
+    elif not isinstance(value, list):
+        raise HTTPException(status_code=400, detail="Invalid headcounts format.")
 
-    limits: List[int] = []
+    out: List[Tuple[int, int]] = []
+
     for item in value:
-        s = _normalize_dash(clean_str(item)).upper()
-        if not s or s == "ALL":
+        s = _normalize_dash(clean_str(item))
+        if not s:
             continue
 
         if "-" in s:
-            lo, hi = [x.strip() for x in s.split("-", 1)]
-            if not lo.isdigit() or not hi.isdigit():
-                raise HTTPException(status_code=400, detail="Invalid headcount range.")
-            lo_i, hi_i = int(lo), int(hi)
-            if lo_i <= 0 or lo_i > hi_i:
-                raise HTTPException(status_code=400, detail="Invalid headcount range.")
-            limits.append(hi_i)
+            lo, hi = [int(x.strip()) for x in s.split("-", 1)]
+            out.append((lo, hi))
         else:
-            if not s.isdigit() or int(s) <= 0:
-                raise HTTPException(status_code=400, detail="Invalid headcount value.")
-            limits.append(int(s))
+            n = int(s)
+            out.append((n, n))
 
-    return max(limits) if limits else None
-
+    return out or None
 
 def _previous_year_month(year: int, month: int) -> Tuple[int, int]:
     if month == 1:
@@ -1018,7 +1038,7 @@ def get_client_dashboard_summary(db: Session, payload: Any) -> Dict[str, Any]:
     payload_dict = _payload_to_dict(payload)
 
     # =========================================================
-    # FIXED CLIENT + DEPARTMENT NORMALIZATION
+    # CLIENT + DEPARTMENT NORMALIZATION
     # =========================================================
 
     raw_clients = payload_dict.get("clients", "ALL")
@@ -1042,44 +1062,6 @@ def get_client_dashboard_summary(db: Session, payload: Any) -> Dict[str, Any]:
     depts_list = normalize_comma_list(raw_departments)
 
     selected_shifts = parse_shifts(payload_dict.get("shifts", None))
-    headcount_ranges_raw = payload_dict.get("headcounts", "ALL")
-
-    # =========================================================
-    # HEADCOUNT RANGE PARSER
-    # =========================================================
-
-    def parse_headcount_ranges(headcounts: Any) -> Optional[List[Tuple[int, int]]]:
-        if _is_all(headcounts):
-            return None
-
-        if isinstance(headcounts, str):
-            headcounts = [headcounts]
-
-        ranges = []
-
-        for item in headcounts:
-            s = _normalize_dash(clean_str(item)).upper()
-            if not s or s == "ALL":
-                continue
-
-            if "-" in s:
-                lo, hi = [x.strip() for x in s.split("-", 1)]
-                if not lo.isdigit() or not hi.isdigit():
-                    raise HTTPException(status_code=400, detail="Invalid headcount range.")
-                lo_i, hi_i = int(lo), int(hi)
-            else:
-                if not s.isdigit():
-                    raise HTTPException(status_code=400, detail="Invalid headcount value.")
-                lo_i = hi_i = int(s)
-
-            if lo_i <= 0 or lo_i > hi_i:
-                raise HTTPException(status_code=400, detail="Invalid headcount range.")
-
-            ranges.append((lo_i, hi_i))
-
-        return ranges or None
-
-    headcount_ranges = parse_headcount_ranges(headcount_ranges_raw)
 
     # =========================================================
     # YEAR/MONTH VALIDATION
@@ -1097,7 +1079,6 @@ def get_client_dashboard_summary(db: Session, payload: Any) -> Dict[str, Any]:
 
     base_filters: List[Any] = []
 
-    # CLIENT FILTER
     if clients_list:
         base_filters.append(
             func.lower(func.trim(ShiftAllowances.client)).in_(
@@ -1105,7 +1086,6 @@ def get_client_dashboard_summary(db: Session, payload: Any) -> Dict[str, Any]:
             )
         )
 
-    # DEPARTMENT FILTER
     if depts_list:
         base_filters.append(
             func.lower(func.trim(ShiftAllowances.department)).in_(
@@ -1171,7 +1151,6 @@ def get_client_dashboard_summary(db: Session, payload: Any) -> Dict[str, Any]:
         .filter(or_(*yr_month_filters))
     )
 
-    # SHIFT FILTER
     if selected_shifts:
         rows_q = rows_q.filter(
             func.upper(func.trim(ShiftMapping.shift_type)).in_(selected_shifts)
@@ -1202,18 +1181,6 @@ def get_client_dashboard_summary(db: Session, payload: Any) -> Dict[str, Any]:
             clients_set.add(client)
         if dept:
             depts_set.add(dept)
-
-    # =========================================================
-    # HEADCOUNT RANGE FILTER
-    # =========================================================
-
-    if headcount_ranges:
-        hc_len = len(headcount_set)
-        if not any(lo <= hc_len <= hi for lo, hi in headcount_ranges):
-            return {
-                "summary": {"selected_periods": selected_periods},
-                "messages": messages
-            }
 
     # =========================================================
     # PREVIOUS MONTH CALCULATIONS
@@ -1293,7 +1260,6 @@ def get_client_dashboard_summary(db: Session, payload: Any) -> Dict[str, Any]:
         "summary": summary,
         "messages": messages if messages else []
     }
-
 
 try:
     from utils.shift_config import get_all_shift_keys

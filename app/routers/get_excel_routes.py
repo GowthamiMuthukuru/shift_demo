@@ -14,12 +14,14 @@ def download_excel(
     payload: dict = Body(
         ...,
         example={
-            "clients": "ALL",
-            "departments": "ALL",
-            "years": [2025],
-            "months": [1, 2, 3],
-            "shifts": "ALL",
-            "headcounts": "ALL",
+            "clients": "ALL",              # string or CSV or list
+            "departments": "ALL",          # string or CSV or list
+            "years": [2025],               # list[int]
+            "months": [1, 2, 3],           # list[int]
+            "shifts": "ALL",               # string or CSV or list
+            "headcounts": "ALL",           # validated but not used for filtering here
+            "emp_id": "IN12345",            # NEW: string or CSV or list (exact match, case-insensitive)
+            "client_partner": "John Doe",  # NEW: string or CSV or list (exact match, case-insensitive)
             "sort_by": "total_allowance",
             "sort_order": "default"
         }

@@ -891,7 +891,6 @@ def get_client_dashboard(db: Session, filters) -> Dict[str, Any]:
     """
     today = date.today()
 
-    # --- Payload validations ---
     if filters.years and filters.years != [0]:
         for y in filters.years:
             yi = _safe_int(y)
@@ -952,11 +951,10 @@ def get_client_dashboard(db: Session, filters) -> Dict[str, Any]:
         if top_int <= 0:
             raise HTTPException(400, "top must be > 0")
 
-    # --- Build rate map for shifts ---
+    
     rate_rows = db.query(ShiftsAmount).all()
     rates = {str(r.shift_type).upper(): Decimal(r.amount) for r in rate_rows}
 
-    # --- Base query ---
     q = db.query(ShiftAllowances)
 
     # Client filter
@@ -971,7 +969,7 @@ def get_client_dashboard(db: Session, filters) -> Dict[str, Any]:
             norm = filters.clients.strip().lower()
             q = q.filter(func.lower(func.trim(ShiftAllowances.client)) == norm)
 
-    # --- Department filter (FIX APPLIED HERE) ---
+    
     # Case-insensitive, handles both string and list, and is applied BEFORE period resolution.
     if getattr(filters, "departments", "ALL") != "ALL":
         if isinstance(filters.departments, list):
@@ -983,7 +981,7 @@ def get_client_dashboard(db: Session, filters) -> Dict[str, Any]:
             if norm_dept:
                 q = q.filter(func.lower(func.trim(ShiftAllowances.department)) == norm_dept)
 
-    # --- Resolve periods with the ALREADY FILTERED query ---
+    
     years, months_by_year, messages = _resolve_periods_and_messages(db, q, filters, today)
 
     # Apply the (year, month) clauses
@@ -996,10 +994,10 @@ def get_client_dashboard(db: Session, filters) -> Dict[str, Any]:
     if pair_clauses:
         q = q.filter(or_(*pair_clauses))
 
-    # --- Load rows after all filters applied ---
+   
     rows = q.all()
 
-    # --- Headcount rules and shift selection ---
+   
     hc_rules = _parse_headcount_filter(filters.headcounts)
 
     selected_shifts: Optional[Set[str]] = None
@@ -1009,13 +1007,12 @@ def get_client_dashboard(db: Session, filters) -> Dict[str, Any]:
         else:
             selected_shifts = {str(filters.shifts).upper()}
 
-    # --- Aggregate to client level ---
+  
     employees_by_client: Dict[str, Set[str]] = {}
     departments_by_client: Dict[str, Set[str]] = {}
     allowances_by_client: Dict[str, Decimal] = {}
 
-    # To access shift mappings, ensure your ORM relationships are configured;
-    # here we assume "row.shift_mappings" yields mapping entries.
+    
     VALID_SHIFTS = set(get_all_shift_keys())
 
     for row in rows:
@@ -1042,7 +1039,6 @@ def get_client_dashboard(db: Session, filters) -> Dict[str, Any]:
             rate = rates.get(shift_key, Decimal(0))
             allowances_by_client[client] += days * rate
 
-    # --- Build items with headcount filter applied at CLIENT level ---
     items = []
     for client, total in allowances_by_client.items():
         hc = len(employees_by_client.get(client, []))
@@ -1064,7 +1060,7 @@ def get_client_dashboard(db: Session, filters) -> Dict[str, Any]:
             "total_allowance": float(total),
         })
 
-    # --- Sorting and top ---
+    
     sort_by = getattr(filters, "sort_by", "total_allowance")
     sort_order = getattr(filters, "sort_order", "desc").lower()
     valid_sort_keys = {"client", "client_partner", "headcount", "total_allowance", "departments"}
@@ -1081,7 +1077,6 @@ def get_client_dashboard(db: Session, filters) -> Dict[str, Any]:
     if top_int:
         items = items[:top_int]
 
-    # --- Ordered dashboard ---
     dashboard = OrderedDict()
     for it in items:
         dashboard[it["client"]] = {
