@@ -343,7 +343,7 @@ def export_filtered_excel(
     sort_by: str = "total_allowance",
     sort_order: str = "default",
 ):
-  
+
     shift_values = _normalize_to_list(shifts)
     if shift_values:
         allowed = {s.upper().strip() for s in get_all_shift_keys()}
@@ -355,17 +355,35 @@ def export_filtered_excel(
             )
     shift_values_up = [s.upper().strip() for s in (shift_values or [])]
 
+    # FIXED FUNCTION
     def _apply_filters_no_period(q):
-        if emp_id:
-            q = q.filter(func.upper(ShiftAllowances.emp_id).like(f"%{emp_id.upper()}%"))
 
-        if client_partner:
-            q = q.filter(
-                func.upper(ShiftAllowances.client_partner).like(f"%{client_partner.upper()}%")
-            )
+        # SAFE emp_id handling
+        emp_ids = _normalize_to_list(emp_id)
+        if emp_ids:
+            like_terms = [
+                func.upper(ShiftAllowances.emp_id).like(f"%{e.upper()}%")
+                for e in emp_ids
+            ]
+            q = q.filter(or_(*like_terms))
 
-        q = apply_client_department_filters(q, clients=clients, departments=departments)
+        # SAFE client_partner handling
+        partner_vals = _normalize_to_list(client_partner)
+        if partner_vals:
+            like_terms = [
+                func.upper(ShiftAllowances.client_partner).like(f"%{p.upper()}%")
+                for p in partner_vals
+            ]
+            q = q.filter(or_(*like_terms))
 
+        # Clients & Departments
+        q = apply_client_department_filters(
+            q,
+            clients=clients,
+            departments=departments
+        )
+
+        # Shift filter
         if shift_values:
             q = q.filter(
                 exists().where(
@@ -376,9 +394,9 @@ def export_filtered_excel(
                     )
                 )
             )
+
         return q
 
- 
     def _base_query_for_month(y: int, m: int):
         return db.query(
             ShiftAllowances.id,
@@ -404,7 +422,6 @@ def export_filtered_excel(
 
     messages: List[str] = []
 
-   
     if not years and not months:
         today = date.today()
         current_ym = f"{today.year:04d}-{today.month:02d}"
@@ -438,10 +455,8 @@ def export_filtered_excel(
                 "current_month_fallback_used": fb_ym,
             }
     else:
-        
         periods, meta = _resolve_periods_with_meta(db, years, months)
 
-   
     if meta.get("assumed_current_year"):
         messages.append(f"Months provided without years; assumed current year {date.today().year}.")
     if meta.get("excluded_future_periods"):
@@ -452,7 +467,6 @@ def export_filtered_excel(
             f"fell back to {meta['current_month_fallback_used']}."
         )
 
-    
     def _build_periods_query():
         q = db.query(
             ShiftAllowances.id,
@@ -476,6 +490,7 @@ def export_filtered_excel(
 
         q = q.filter(or_(*period_clauses))
         q = _apply_filters_no_period(q)
+
         q = q.order_by(
             extract("year", ShiftAllowances.duration_month).asc(),
             extract("month", ShiftAllowances.duration_month).asc(),
@@ -489,13 +504,11 @@ def export_filtered_excel(
         extra = (" " + " ".join(messages)) if messages else ""
         raise HTTPException(404, f"No data found for selected period/filters.{extra}")
 
-    # Load shift rates
-    rates = {(r.shift_type or "").upper().strip(): float(r.amount or 0) for r in db.query(ShiftsAmount).all()}
+    rates = {(r.shift_type or "").upper().strip(): float(r.amount or 0)
+             for r in db.query(ShiftsAmount).all()}
 
-    # Aggregate unique employees with shift totals
     unique_employees = _aggregate_unique_employees(db, all_rows, rates)
 
-    # Parse headcount ranges
     headcount_ranges = _parse_headcount_ranges(headcounts)
 
     dept_vals = _normalize_to_list(departments)
@@ -507,7 +520,6 @@ def export_filtered_excel(
     elif client_vals:
         group_key = "client"
 
-    # Apply headcount filter
     filtered_employees = _apply_headcount_filter(unique_employees, group_key, headcount_ranges)
 
     if not filtered_employees:
@@ -517,11 +529,9 @@ def export_filtered_excel(
     filtered_emp_ids = {emp["emp_id"] for emp in filtered_employees}
     filtered_rows = [r for r in all_rows if r.emp_id in filtered_emp_ids]
 
-    # Aggregate shift details on filtered set
     overall_shift, overall_total = aggregate_shift_details(db, filtered_rows, rates)
-    headcount_value = len(filtered_employees)  
+    headcount_value = len(filtered_employees)
 
-    # Sorting
     sort_by_key = (sort_by or "total_allowance").strip().lower()
     sort_order_in = (sort_order or "default").strip().lower()
 
@@ -533,7 +543,9 @@ def export_filtered_excel(
     if sort_order_in not in {"default", "asc", "desc"}:
         raise HTTPException(400, "sort_order must be 'default', 'asc', or 'desc'")
 
-    direction = sort_order_in if sort_order_in != "default" else ("desc" if sort_by_key in {"total_allowance", "headcount"} else "asc")
+    direction = sort_order_in if sort_order_in != "default" else (
+        "desc" if sort_by_key in {"total_allowance", "headcount"} else "asc"
+    )
     reverse = direction == "desc"
 
     if sort_by_key == "total_allowance":
@@ -562,11 +574,9 @@ def export_filtered_excel(
             reverse=reverse,
         )
 
-    # Pagination
     total_unique = len(filtered_employees)
-    employees_page = filtered_employees[start : start + limit]
+    employees_page = filtered_employees[start:start + limit]
 
-   
     all_keys = list(get_all_shift_keys())
     formatted_shift_summary = {
         k: round(float(overall_shift.get(k, 0.0)), 2)
@@ -574,7 +584,6 @@ def export_filtered_excel(
         if float(overall_shift.get(k, 0.0)) > 0.0
     }
 
-   
     country_lookup = {
         "pst_mst": "PST/MST",
         "us_india": "US/India",
@@ -582,15 +591,12 @@ def export_filtered_excel(
         "anz": "Australia New Zealand",
     }
 
-    lookup = {
-        "country": country_lookup
-    }
+    lookup = {"country": country_lookup}
 
-   
     response = {
         "total_records": total_unique,
         "shift_details": [
-            formatted_shift_summary,                 
+            formatted_shift_summary,
             {"total_allowance": round(overall_total, 2), "headcount": headcount_value},
         ],
         "data": {"employees": employees_page},
