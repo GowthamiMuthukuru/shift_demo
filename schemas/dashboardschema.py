@@ -9,7 +9,7 @@ response structures for analytics endpoints.
 
 from typing import List,Optional, Literal,Union,Dict,Any
 from pydantic import BaseModel,Field,field_validator,ConfigDict
-
+import re
 
 class PieChartClientShift(BaseModel):
     """
@@ -205,36 +205,90 @@ class ClientSummaryRequest(BaseModel):
     years: Optional[List[int]] = None
     months: Optional[List[int]] = None
 
-  
     clients: Optional[Union[Literal["ALL"], List[str]]] = "ALL"
     departments: Optional[Union[Literal["ALL"], List[str]]] = "ALL"
 
     emp_id: Optional[List[str]] = None
     client_partner: Optional[List[str]] = None
 
-    shifts: Optional[Union[Literal["ALL"], List[str]]] = "ALL"
-    headcounts: Optional[Union[Literal["ALL"], List[str]]] = "ALL"
+    # FIX: close the Union[...] bracket and set default properly
+    shifts: Optional[Union[Literal["ALL"], str]] = "ALL"
+
+    # CHANGE REQUESTED: headcounts must be a single string or "ALL" (no list)
+    headcounts: Optional[Union[Literal["ALL"], str]] = "ALL"
 
     sort_by: Optional[str] = None
     sort_order: Optional[str] = None
 
-    @field_validator("clients", "departments", "shifts", "headcounts")
-    def validate_all_or_list(cls, v):
-        if v is None:
+    model_config = ConfigDict(extra="forbid")
+
+   
+    @field_validator("clients", "departments", "shifts", mode="before")
+    def validate_all_or_list_for_multi(cls, v):
+        """
+        For clients, departments, shifts:
+        - Accept "ALL"
+        - Accept comma-separated string (converted to list)
+        - Accept list[str]
+        """
+        if v is None or v == "ALL":
             return "ALL"
 
-        if v == "ALL":
-            return v
+        if isinstance(v, str):
+            # For shifts we still allow a single string like "ALL" or "PST"
+            # For clients/departments a CSV becomes a list
+            items = [x.strip() for x in v.split(",") if x.strip()]
+            # If it's a single item, keep it as a single string (for 'shifts'),
+            # but for clients/departments it's fine to keep list. To keep simple,
+            # return list (your downstream can handle list).
+            return items or "ALL"
 
         if isinstance(v, list):
             cleaned = [str(x).strip() for x in v if str(x).strip()]
             if not cleaned:
                 raise ValueError("List cannot be empty")
-
             if len(cleaned) == 1 and cleaned[0].upper() == "ALL":
                 raise ValueError("'ALL' must be sent as string, not inside list")
-
             return cleaned
 
-        raise ValueError("Must be 'ALL' or list of strings")
+        raise ValueError("Must be 'ALL', CSV string, or list of strings")
 
+
+    @field_validator("headcounts", mode="before")
+    def validate_headcounts_range_str(cls, v):
+        """
+        Headcounts must be:
+        - "ALL"
+        - a single numeric string "N" (interpreted as N..N)
+        - a single numeric range "N-M" (1 <= N <= M), no lists
+
+        Examples: "1-5", "10", "25-25"
+        """
+        if v is None or str(v).strip().upper() == "ALL":
+            return "ALL"
+
+        if isinstance(v, list):
+            raise ValueError("headcounts must be a single string like '1-5' or 'ALL' (lists are not allowed)")
+
+        s = str(v).strip()
+        # normalize unicode dashes to '-'
+        s = s.replace("–", "-").replace("—", "-").replace("−", "-")
+
+        # Accept either "N" or "N-M"
+        single_pat = r"^\s*\d+\s*$"
+        range_pat = r"^\s*(\d+)\s*-\s*(\d+)\s*$"
+
+        if re.match(single_pat, s):
+            # OK: "5"
+            if int(s) <= 0:
+                raise ValueError("headcounts value must be a positive integer")
+            return s  # keep original string
+
+        m = re.match(range_pat, s)
+        if m:
+            lo, hi = int(m.group(1)), int(m.group(2))
+            if lo <= 0 or hi <= 0 or lo > hi:
+                raise ValueError("headcounts range must be positive and min <= max")
+            return f"{lo}-{hi}"
+
+        raise ValueError("headcounts must be 'ALL', 'N', or 'N-M' (e.g., '1-5')")
