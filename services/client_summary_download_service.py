@@ -391,23 +391,19 @@ def _apply_headcount_filter(df: pd.DataFrame, headcount_range: Optional[Tuple[in
     return df2
 
 
-
 def client_summary_download_service(db: Session, payload: dict) -> str:
     """
-    Generate and export client summary Excel with a simplified caching strategy.
+    Generate and export client summary Excel with caching.
 
     Enhancements:
-    - Sorting ONLY for months/years (ascending).
-    - If some requested periods have no data, we add a 'Notes' sheet listing them.
-    - If no data at all for requested selection, we write a Notes-only Excel instead of raising.
-    - NEW: Headcount range filter (string "N" or "N-M") applied at DataFrame level.
+    - Supports asc / desc sorting
+    - Keeps default structure unchanged
     """
+
     payload = payload or {}
 
-    # Determine if this is the default request (for caching name/policy)
     default_req = is_default_latest_month_request(payload)
 
-    # Normalize month/year ordering
     if isinstance(payload.get("months"), list) and payload["months"]:
         payload["months"] = sorted({int(m) for m in payload["months"]})
     if isinstance(payload.get("years"), list) and payload["years"]:
@@ -415,7 +411,6 @@ def client_summary_download_service(db: Session, payload: dict) -> str:
 
     requested_periods = _requested_periods_from_payload(payload)
 
-    # Build cache anchors (latest month + shift signature) for default requests
     latest_ym = _get_db_latest_ym(db) if default_req else None
     shift_sig = _current_shift_signature() if default_req else None
 
@@ -442,64 +437,59 @@ def client_summary_download_service(db: Session, payload: dict) -> str:
             if cached_path and os.path.exists(cached_path):
                 return cached_path
 
-
     notes_lines: List[str] = []
-    try:
-        summary_data = client_summary_service(db, payload)
-    except HTTPException as e:
-        if e.status_code == 404 and (payload.get("months") or payload.get("years")):
-            notes_lines.append("No data present for the selected month(s)/year(s).")
-            empty_df = pd.DataFrame()
-            if default_req:
-                written_path = _atomic_write_excel(
-                    empty_df, [], final_default_path, notes_lines=notes_lines
-                )
-                cache.set(
-                    cache_key,
-                    {"_cached_month": latest_ym, "file_path": written_path, "shift_sig": shift_sig},
-                    expire=CACHE_TTL,
-                )
-                return written_path
-            else:
-                hashed_name = cache_key.split(":", 1)[-1]
-                if not hashed_name.endswith(".xlsx"):
-                    hashed_name += ".xlsx"
-                path = os.path.join(EXPORT_DIR, hashed_name)
-                written_path = _atomic_write_excel(
-                    empty_df, [], path, notes_lines=notes_lines
-                )
-                cache.set(cache_key, {"file_path": written_path}, expire=CACHE_TTL)
-                return written_path
-        raise
 
-    # Optional filters (emp_id / client_partner) at export level
+    summary_data = client_summary_service(db, payload)
+
     emp_ids_filter = _normalize_multi_str_or_list(payload.get("emp_id"))
     partner_filter = _normalize_multi_str_or_list(payload.get("client_partner"))
 
-    # Build DF
     df, shift_cols = _build_dataframe_from_summary(
         summary_data,
         emp_ids_filter,
         partner_filter,
     )
+
     currency_cols = shift_cols + ["Total Allowance"]
 
     headcount_range = _parse_headcount_range_str(payload.get("headcounts"))
     df = _apply_headcount_filter(df, headcount_range)
 
-   
-    if requested_periods:
-        present_periods = set(summary_data.keys())
-        missing_periods = [p for p in requested_periods if p not in present_periods]
-        if missing_periods:
-            pretty_missing = ", ".join(missing_periods)
-            notes_lines.append(
-                f"No data present for the following selected period(s): {pretty_missing}"
+  
+
+    sort_by = (payload.get("sort_by") or "total_allowance").lower()
+    sort_order = (payload.get("sort_order") or "default").lower()
+
+    sort_column_map = {
+        "total_allowance": "Total Allowance",
+        "client": "Client",
+        "client_partner": "Client Partner",
+        "headcount": "Head Count",
+        "departments": "Department",
+    }
+
+    sort_column = sort_column_map.get(sort_by)
+
+    if df is not None and not df.empty and sort_column in df.columns:
+
+        if sort_order == "asc":
+            df = df.sort_values(by=sort_column, ascending=True)
+
+        elif sort_order == "desc":
+            df = df.sort_values(by=sort_column, ascending=False)
+
+        else:
+            
+            df = df.sort_values(
+                by=["Period", "Client", "Department", "Employee ID"]
             )
+
+    
 
     if df is None or df.empty:
         if not notes_lines:
             notes_lines.append("No data present.")
+
         if default_req:
             written_path = _atomic_write_excel(
                 pd.DataFrame(), [], final_default_path, notes_lines=notes_lines
@@ -510,16 +500,17 @@ def client_summary_download_service(db: Session, payload: dict) -> str:
                 expire=CACHE_TTL,
             )
             return written_path
-        else:
-            hashed_name = cache_key.split(":", 1)[-1]
-            if not hashed_name.endswith(".xlsx"):
-                hashed_name += ".xlsx"
-            path = os.path.join(EXPORT_DIR, hashed_name)
-            written_path = _atomic_write_excel(
-                pd.DataFrame(), [], path, notes_lines=notes_lines
-            )
-            cache.set(cache_key, {"file_path": written_path}, expire=CACHE_TTL)
-            return written_path
+
+        hashed_name = cache_key.split(":", 1)[-1]
+        if not hashed_name.endswith(".xlsx"):
+            hashed_name += ".xlsx"
+
+        path = os.path.join(EXPORT_DIR, hashed_name)
+        written_path = _atomic_write_excel(
+            pd.DataFrame(), [], path, notes_lines=notes_lines
+        )
+        cache.set(cache_key, {"file_path": written_path}, expire=CACHE_TTL)
+        return written_path
 
     if default_req:
         written_path = _atomic_write_excel(
@@ -535,9 +526,13 @@ def client_summary_download_service(db: Session, payload: dict) -> str:
     hashed_name = cache_key.split(":", 1)[-1]
     if not hashed_name.endswith(".xlsx"):
         hashed_name += ".xlsx"
+
     path = os.path.join(EXPORT_DIR, hashed_name)
+
     written_path = _atomic_write_excel(
         df, currency_cols, path, notes_lines=notes_lines
     )
+
     cache.set(cache_key, {"file_path": written_path}, expire=CACHE_TTL)
+
     return written_path
