@@ -2,7 +2,7 @@
 from __future__ import annotations
 from datetime import datetime, date,timedelta
 from calendar import monthrange
-
+from utils.client_enums import Company
 from typing import Optional, Dict, Any, Union,List,Tuple,Set
 from decimal import Decimal,InvalidOperation
 from fastapi import HTTPException
@@ -402,6 +402,20 @@ def _normalize_shifts_filter(shifts: Union[str, List[str], None]) -> Optional[Se
     cleaned = {str(s).strip().upper() for s in shifts if str(s).strip()}
     return cleaned or None
 
+def _get_company_enum_key(client_name: str) -> str:
+    """
+    Convert full client name to enum key.
+    If not found in enum, return original name.
+    """
+    if not client_name:
+        return client_name
+
+    for company in Company:
+        if company.value.strip().lower() == client_name.strip().lower():
+            return company.name  # e.g., ILC_DOVER
+
+    return client_name
+
 def get_client_total_allowances(db: Session, filters):
     today = date.today()
     current_year = today.year
@@ -421,18 +435,29 @@ def get_client_total_allowances(db: Session, filters):
 
     base_query = db.query(ShiftAllowances)
 
+    # Client filter
     if filters.clients != "ALL":
         if isinstance(filters.clients, list):
-            base_query = base_query.filter(ShiftAllowances.client.in_(filters.clients))
+            base_query = base_query.filter(
+                ShiftAllowances.client.in_(filters.clients)
+            )
         else:
-            base_query = base_query.filter(ShiftAllowances.client == filters.clients)
+            base_query = base_query.filter(
+                ShiftAllowances.client == filters.clients
+            )
 
+    # Department filter
     if filters.departments != "ALL":
         if isinstance(filters.departments, list):
-            base_query = base_query.filter(ShiftAllowances.department.in_(filters.departments))
+            base_query = base_query.filter(
+                ShiftAllowances.department.in_(filters.departments)
+            )
         else:
-            base_query = base_query.filter(ShiftAllowances.department == filters.departments)
+            base_query = base_query.filter(
+                ShiftAllowances.department == filters.departments
+            )
 
+    # Default period logic
     if not years and not months:
         current_exists = base_query.filter(
             func.extract("year", ShiftAllowances.duration_month) == current_year,
@@ -450,6 +475,7 @@ def get_client_total_allowances(db: Session, filters):
                 .order_by(ShiftAllowances.duration_month.desc())
                 .first()
             )
+
             if latest and latest.duration_month:
                 latest_date = latest.duration_month
                 years = [latest_date.year]
@@ -461,42 +487,64 @@ def get_client_total_allowances(db: Session, filters):
             else:
                 years = [current_year]
                 months = [current_month]
+
     elif months and not years:
         years = [current_year]
     elif years and not months:
         months = list(range(1, 13))
 
+    # Apply year/month filters
     q = base_query.filter(
         func.extract("year", ShiftAllowances.duration_month).in_(years)
     ).filter(
         func.extract("month", ShiftAllowances.duration_month).in_(months)
     )
 
+    # Employee filter
     if getattr(filters, "emp_id", None):
         emp_list = filters.emp_id if isinstance(filters.emp_id, list) else [filters.emp_id]
-        q = q.filter(or_(*[func.upper(ShiftAllowances.emp_id) == str(e).upper() for e in emp_list]))
+        q = q.filter(
+            or_(*[
+                func.upper(ShiftAllowances.emp_id) == str(e).upper()
+                for e in emp_list
+            ])
+        )
 
+    # Client partner filter
     if getattr(filters, "client_partner", None):
         cp_list = filters.client_partner if isinstance(filters.client_partner, list) else [filters.client_partner]
         q = q.filter(
-            or_(*[func.upper(ShiftAllowances.client_partner).like(f"%{str(cp).upper()}%") for cp in cp_list])
+            or_(*[
+                func.upper(ShiftAllowances.client_partner).like(f"%{str(cp).upper()}%")
+                for cp in cp_list
+            ])
         )
 
     rows = q.all()
 
+    # Load shift rates
     rate_rows = db.query(ShiftsAmount).all()
-    rates = {str(r.shift_type).upper(): Decimal(r.amount or 0) for r in rate_rows}
+    rates = {
+        str(r.shift_type).upper(): Decimal(r.amount or 0)
+        for r in rate_rows
+    }
 
-    allowed_shifts: Optional[Set[str]] = _normalize_shifts_filter(getattr(filters, "shifts", None))
+    allowed_shifts: Optional[Set[str]] = _normalize_shifts_filter(
+        getattr(filters, "shifts", None)
+    )
 
     client_totals: Dict[str, Decimal] = defaultdict(lambda: Decimal(0))
     client_emps: Dict[str, set] = defaultdict(set)
     client_shifts: Dict[str, Dict[str, Decimal]] = defaultdict(lambda: defaultdict(lambda: Decimal(0)))
-    client_depts: Dict[str, Dict[str, Dict[str, Any]]] = defaultdict(lambda: defaultdict(lambda: {
-        "total": Decimal(0),
-        "shifts": defaultdict(lambda: Decimal(0)),
-        "emp_ids": set()
-    }))
+    client_depts: Dict[str, Dict[str, Dict[str, Any]]] = defaultdict(
+        lambda: defaultdict(
+            lambda: {
+                "total": Decimal(0),
+                "shifts": defaultdict(lambda: Decimal(0)),
+                "emp_ids": set()
+            }
+        )
+    )
 
     for row in rows:
         client = row.client or "Unknown"
@@ -509,12 +557,16 @@ def get_client_total_allowances(db: Session, filters):
         for mapping in mappings:
             shift_key = str(mapping.shift_type or "").upper()
             days = Decimal(mapping.days or 0)
+
             if days <= 0:
                 continue
+
             if allowed_shifts and shift_key not in allowed_shifts:
                 continue
+
             rate = rates.get(shift_key, Decimal(0))
             amount = days * rate
+
             if amount <= 0:
                 continue
 
@@ -529,22 +581,37 @@ def get_client_total_allowances(db: Session, filters):
             client_emps[client].add(emp)
             client_depts[client][dept]["emp_ids"].add(emp)
 
-   
-    headcount_rules = _parse_headcount_filter(getattr(filters, "headcounts", None))
+    headcount_rules = _parse_headcount_filter(
+        getattr(filters, "headcounts", None)
+    )
+
     result: List[Dict[str, Any]] = []
 
     for client, total in client_totals.items():
         headcount = len(client_emps.get(client, set()))
+
         if not _headcount_matches(headcount, headcount_rules):
             continue
 
-        shifts_out = {k: float(v) for k, v in client_shifts.get(client, {}).items() if v > 0}
+        enum_key = _get_company_enum_key(client)
+
+        shifts_out = {
+            k: float(v)
+            for k, v in client_shifts.get(client, {}).items()
+            if v > 0
+        }
+
         depts_out = []
 
         for dept, drec in client_depts[client].items():
             d_head = len(drec["emp_ids"])
             d_total = float(drec["total"])
-            d_shifts = {sk: float(av) for sk, av in drec["shifts"].items() if av > 0}
+            d_shifts = {
+                sk: float(av)
+                for sk, av in drec["shifts"].items()
+                if av > 0
+            }
+
             if d_total > 0:
                 depts_out.append({
                     "department": dept,
@@ -554,49 +621,40 @@ def get_client_total_allowances(db: Session, filters):
                 })
 
         result.append({
-            "client": client,
+            "client": enum_key,
+            "display_name": client,
             "headcount": headcount,
             "total_allowance": float(total),
             "shifts": shifts_out,
             "departments": depts_out
         })
 
+    # Sorting
     sort_by_key = getattr(filters, "sort_by", "total_allowance")
     sort_order_in = getattr(filters, "sort_order", "desc").lower()
     reverse = sort_order_in == "desc"
 
-    valid_sort_keys = {"client", "client_partner", "headcount", "departments", "total_allowance"}
-    if sort_by_key not in valid_sort_keys:
-        raise HTTPException(
-            status_code=400,
-            detail=f"sort_by must be one of {', '.join(sorted(valid_sort_keys))}"
-        )
-
     if sort_by_key == "departments":
-       
         result.sort(
             key=lambda x: sum(d["total_allowance"] for d in x.get("departments", [])),
             reverse=reverse
         )
     else:
-       
         result.sort(
-            key=lambda x: (x.get(sort_by_key) if sort_by_key != "client_partner" else str(x.get(sort_by_key) or "").upper()),
+            key=lambda x: x.get(sort_by_key),
             reverse=reverse
         )
 
- 
+    # Top filter
     top_value = getattr(filters, "top", None)
-    if top_value is not None:
-        if str(top_value).lower() == "all":
-            pass
-        else:
-            if not str(top_value).isdigit() or int(top_value) <= 0:
-                raise HTTPException(
-                    status_code=400,
-                    detail="top must be a positive integer or ALL"
-                )
-            result = result[:int(top_value)]
+
+    if top_value and str(top_value).lower() != "all":
+        if not str(top_value).isdigit() or int(top_value) <= 0:
+            raise HTTPException(
+                status_code=400,
+                detail="top must be positive integer or ALL"
+            )
+        result = result[:int(top_value)]
 
     if not result and not messages:
         messages.append("No data found for selected periods.")

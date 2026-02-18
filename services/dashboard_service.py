@@ -1019,12 +1019,6 @@ def get_previous_month_unique_employees(db: Session, base_filters, year: int, mo
 
 
 def get_client_dashboard_summary(db: Session, payload: Any) -> Dict[str, Any]:
-    """
-    Dashboard summary with multi-filter support.
-    Filters applied:
-      - clients, departments, shifts, headcounts, years, months
-    Returns summary + messages (future month warnings + no-data messages)
-    """
 
     if ShiftAllowances is None or ShiftMapping is None or ShiftsAmount is None:
         return {
@@ -1037,9 +1031,7 @@ def get_client_dashboard_summary(db: Session, payload: Any) -> Dict[str, Any]:
 
     payload_dict = _payload_to_dict(payload)
 
-    # =========================================================
-    # CLIENT + DEPARTMENT NORMALIZATION
-    # =========================================================
+ 
 
     raw_clients = payload_dict.get("clients", "ALL")
     raw_departments = payload_dict.get("departments", "ALL")
@@ -1047,60 +1039,27 @@ def get_client_dashboard_summary(db: Session, payload: Any) -> Dict[str, Any]:
     def normalize_comma_list(value):
         if _is_all(value):
             return None
-
         if isinstance(value, str):
             items = [clean_str(x) for x in value.split(",") if clean_str(x)]
             return items or None
-
         if isinstance(value, list):
             items = [clean_str(x) for x in value if clean_str(x)]
             return items or None
-
         return None
 
     clients_list = normalize_comma_list(raw_clients)
     depts_list = normalize_comma_list(raw_departments)
-
     selected_shifts = parse_shifts(payload_dict.get("shifts", None))
+    headcount_ranges = parse_headcount_ranges(payload_dict.get("headcounts"))
 
-    # =========================================================
-    # YEAR/MONTH VALIDATION
-    # =========================================================
+    
 
     pairs, messages = validate_years_months_with_warnings(payload, db=db)
     pairs = sorted(set(pairs))
 
-    if not pairs and not messages:
-        messages.append("No data found for selected filters.")
-
-    # =========================================================
-    # BASE FILTERS
-    # =========================================================
-
-    base_filters: List[Any] = []
-
-    if clients_list:
-        base_filters.append(
-            func.lower(func.trim(ShiftAllowances.client)).in_(
-                [c.lower().strip() for c in clients_list if c]
-            )
-        )
-
-    if depts_list:
-        base_filters.append(
-            func.lower(func.trim(ShiftAllowances.department)).in_(
-                [d.lower().strip() for d in depts_list if d]
-            )
-        )
-
-    # =========================================================
-    # SELECTED PERIODS FORMAT
-    # =========================================================
-
-    selected_periods: List[Dict[str, Any]] = []
-
+    selected_periods = []
     if pairs:
-        grouped: Dict[int, List[int]] = defaultdict(list)
+        grouped = defaultdict(list)
         for y, m in pairs:
             grouped[y].append(m)
 
@@ -1110,53 +1069,72 @@ def get_client_dashboard_summary(db: Session, payload: Any) -> Dict[str, Any]:
                 "months": sorted(set(grouped[y]))
             })
 
-    # =========================================================
-    # QUERY BUILD
-    # =========================================================
+    if not pairs:
+        return {
+            "summary": {"selected_periods": selected_periods},
+            "messages": messages
+        }
 
-    ShiftsAmountAlias = aliased(ShiftsAmount)
+ 
+    base_filters = []
 
-    yr_month_filters = [
-        and_(
-            extract("year", ShiftAllowances.duration_month) == y,
-            extract("month", ShiftAllowances.duration_month) == m,
-        )
-        for y, m in pairs
-    ]
-
-    rows_q = (
-        db.query(
-            ShiftAllowances.emp_id,
-            ShiftAllowances.client,
-            ShiftAllowances.department,
-            ShiftAllowances.client_partner,
-            ShiftMapping.shift_type,
-            ShiftMapping.days,
-            func.coalesce(ShiftsAmountAlias.amount, 0),
-        )
-        .select_from(ShiftAllowances)
-        .join(ShiftMapping, ShiftMapping.shiftallowance_id == ShiftAllowances.id)
-        .outerjoin(
-            ShiftsAmountAlias,
-            (
-                extract("year", ShiftAllowances.duration_month)
-                == cast(ShiftsAmountAlias.payroll_year, Integer)
+    if clients_list:
+        base_filters.append(
+            func.lower(func.trim(ShiftAllowances.client)).in_(
+                [c.lower().strip() for c in clients_list]
             )
-            & (
-                func.upper(func.trim(ShiftMapping.shift_type))
-                == func.upper(func.trim(ShiftsAmountAlias.shift_type))
-            ),
-        )
-        .filter(*base_filters)
-        .filter(or_(*yr_month_filters))
-    )
-
-    if selected_shifts:
-        rows_q = rows_q.filter(
-            func.upper(func.trim(ShiftMapping.shift_type)).in_(selected_shifts)
         )
 
-    rows = rows_q.all()
+    if depts_list:
+        base_filters.append(
+            func.lower(func.trim(ShiftAllowances.department)).in_(
+                [d.lower().strip() for d in depts_list]
+            )
+        )
+
+    
+
+    def fetch_rows_for_month(year, month):
+        ShiftsAmountAlias = aliased(ShiftsAmount)
+
+        q = (
+            db.query(
+                ShiftAllowances.emp_id,
+                ShiftAllowances.client,
+                ShiftAllowances.department,
+                ShiftAllowances.client_partner,
+                ShiftMapping.shift_type,
+                ShiftMapping.days,
+                func.coalesce(ShiftsAmountAlias.amount, 0),
+            )
+            .select_from(ShiftAllowances)
+            .join(ShiftMapping, ShiftMapping.shiftallowance_id == ShiftAllowances.id)
+            .outerjoin(
+                ShiftsAmountAlias,
+                (
+                    extract("year", ShiftAllowances.duration_month)
+                    == cast(ShiftsAmountAlias.payroll_year, Integer)
+                )
+                & (
+                    func.upper(func.trim(ShiftMapping.shift_type))
+                    == func.upper(func.trim(ShiftsAmountAlias.shift_type))
+                ),
+            )
+            .filter(*base_filters)
+            .filter(extract("year", ShiftAllowances.duration_month) == year)
+            .filter(extract("month", ShiftAllowances.duration_month) == month)
+        )
+
+        if selected_shifts:
+            q = q.filter(
+                func.upper(func.trim(ShiftMapping.shift_type)).in_(selected_shifts)
+            )
+
+        return q.all()
+
+
+    latest_y, latest_m = pairs[-1]
+    rows = fetch_rows_for_month(latest_y, latest_m)
 
     if not rows:
         return {
@@ -1164,16 +1142,57 @@ def get_client_dashboard_summary(db: Session, payload: Any) -> Dict[str, Any]:
             "messages": messages
         }
 
-    # =========================================================
-    # CALCULATIONS
-    # =========================================================
+
+
+    def apply_headcount_filter(rows):
+        if not headcount_ranges:
+            return rows
+
+        grouping_map = defaultdict(set)
+
+        for emp, client, dept, cp, shift, days, amt in rows:
+            if not emp:
+                continue
+
+            key = (client, dept) if depts_list else client
+            grouping_map[key].add(emp)
+
+        allowed_groups = set()
+
+        for key, emp_set in grouping_map.items():
+            hc = len(emp_set)
+            for lo, hi in headcount_ranges:
+                if lo <= hc <= hi:
+                    allowed_groups.add(key)
+                    break
+
+        filtered = []
+        for row in rows:
+            emp, client, dept, cp, shift, days, amt = row
+            key = (client, dept) if depts_list else client
+            if key in allowed_groups:
+                filtered.append(row)
+
+        return filtered
+
+    rows = apply_headcount_filter(rows)
+
+    if not rows:
+        return {
+            "summary": {"selected_periods": selected_periods},
+            "messages": messages
+        }
+
+  
+ 
 
     total_allowance = 0.0
-    clients_set, depts_set, headcount_set = set(), set(), set()
+    clients_set = set()
+    depts_set = set()
+    headcount_set = set()
 
     for emp, client, dept, cp, shift, days, amt in rows:
-        allowance = float(days or 0) * float(amt or 0)
-        total_allowance += allowance
+        total_allowance += float(days or 0) * float(amt or 0)
 
         if emp:
             headcount_set.add(emp)
@@ -1182,69 +1201,58 @@ def get_client_dashboard_summary(db: Session, payload: Any) -> Dict[str, Any]:
         if dept:
             depts_set.add(dept)
 
-    # =========================================================
-    # PREVIOUS MONTH CALCULATIONS
-    # =========================================================
-
-    latest_y, latest_m = pairs[-1]
-
-    previous_total = get_previous_month_allowance(
-        db, base_filters, latest_y, latest_m
-    )
-
+  
     prev_y, prev_m = _previous_year_month(latest_y, latest_m)
+    prev_rows = fetch_rows_for_month(prev_y, prev_m)
+    prev_rows = apply_headcount_filter(prev_rows)
 
+    previous_total = 0.0
+    previous_clients_set = set()
+    previous_depts_set = set()
+    previous_headcount_set = set()
+
+    for emp, client, dept, cp, shift, days, amt in prev_rows:
+        previous_total += float(days or 0) * float(amt or 0)
+
+        if emp:
+            previous_headcount_set.add(emp)
+        if client:
+            previous_clients_set.add(client)
+        if dept:
+            previous_depts_set.add(dept)
+
+    # Previous of previous (allowance trend only)
     prev_prev_total = get_previous_month_allowance(
         db, base_filters, prev_y, prev_m
     )
 
-    previous_clients_count = get_previous_month_unique_clients(
-        db, base_filters, latest_y, latest_m
-    )
-
-    previous_departments_count = get_previous_month_unique_departments(
-        db, base_filters, latest_y, latest_m
-    )
-
-    previous_head_count = get_previous_month_unique_employees(
-        db, base_filters, latest_y, latest_m
-    )
-
-    # =========================================================
-    # CHANGE CALCULATOR
-    # =========================================================
+    
 
     def calc_change(curr, prev):
         if not prev:
             return "N/A"
-        try:
-            pct = round(((curr - prev) / prev) * 100, 2)
-        except ZeroDivisionError:
-            return "N/A"
-
+        pct = round(((curr - prev) / prev) * 100, 2)
         if pct > 0:
             return f"{pct}% increase"
         if pct < 0:
             return f"{abs(pct)}% decrease"
         return "0% no change"
 
-    # =========================================================
-    # FINAL SUMMARY
-    # =========================================================
+ 
 
     summary = {
         "selected_periods": selected_periods,
         "total_clients": len(clients_set),
         "total_clients_last_month": calc_change(
-            len(clients_set), previous_clients_count
+            len(clients_set), len(previous_clients_set)
         ),
         "total_departments": len(depts_set),
         "total_departments_last_month": calc_change(
-            len(depts_set), previous_departments_count
+            len(depts_set), len(previous_depts_set)
         ),
         "head_count": len(headcount_set),
         "head_count_last_month": calc_change(
-            len(headcount_set), previous_head_count
+            len(headcount_set), len(previous_headcount_set)
         ),
         "total_allowance": round(total_allowance, 2),
         "total_allowance_last_month": calc_change(
@@ -1260,6 +1268,7 @@ def get_client_dashboard_summary(db: Session, payload: Any) -> Dict[str, Any]:
         "summary": summary,
         "messages": messages if messages else []
     }
+
 
 try:
     from utils.shift_config import get_all_shift_keys
