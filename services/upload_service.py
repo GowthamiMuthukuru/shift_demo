@@ -114,7 +114,8 @@ def validate_excel_data(df: pd.DataFrame):
         for col in ["duration_month", "payroll_month"]:
             val = str(row.get(col, "")).strip()
             if val and not month_pattern.match(val):
-                row_errors.append(f"Invalid month format in '{col}'")
+                row_errors.append(f"Invalid duration_month format in '{col}'")
+                row_errors.append(f"Invalid payroll_month format in '{col}'")
 
        
         try:
@@ -150,7 +151,9 @@ def normalize_error_rows(error_rows):
                 else:
                     reason["numeric"] = "Expected non-negative numeric value"
             elif "month format" in err:
-                reason["month"] = "Expected Mon'YY format"
+                reason["duration_month"] = "Expected Mon'YY format"
+            elif "month_format" in err:
+                reason["payroll_month"] = "Expected Mon'YY format"
             elif "Total days" in err:
                 reason["total_days"] = "Shift days mismatch"
         r["reason"] = reason

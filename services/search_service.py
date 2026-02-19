@@ -256,7 +256,7 @@ def _apply_headcount_filter(
     return [emp for emp in unique_employees if str(emp.get(group_key) or "UNKNOWN").upper() in allowed_groups]
 
 
- #
+ 
 
 def _compute_row_totals(
     db: Session,
