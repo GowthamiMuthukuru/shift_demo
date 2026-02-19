@@ -292,3 +292,59 @@ class ClientSummaryRequest(BaseModel):
             return f"{lo}-{hi}"
 
         raise ValueError("headcounts must be 'ALL', 'N', or 'N-M' (e.g., '1-5')")
+
+class DeptDashboardFilter(BaseModel):
+    """
+    Department dashboard filters.
+    """
+    clients: Union[str, List[str]] = "ALL"
+    departments: Union[str, List[str]] = "ALL"
+    years: List[int] = [0]
+    months: List[int] = [0]
+    headcounts: Union[str, List[str]] = "ALL"
+    shifts: Union[str, List[str]] = "ALL"
+    top: str = "ALL"
+
+    # ONLY department "starts with" filter is supported:
+    department_starts_with: Optional[str] = None
+    allowance: Optional[Union[str, List[str]]] = None
+    # Sorting options for department dashboard
+    sort_by: Literal["total_allowance", "department", "clients", "headcount"] = "total_allowance"
+    sort_order: Literal["asc", "desc", "default"] = "default"
+
+
+class DepartmentDashboardItem(BaseModel):
+    clients: int
+    headcount: int
+    total_allowance: float
+
+
+class DepartmentDashboardResponse(BaseModel):
+    summary: Dict[str, Any]
+    messages: List[str]
+    dashboard: Dict[str, DepartmentDashboardItem]
+
+
+class DepartmentAnalyticsRequest(BaseModel):
+    # Exact-match filters only
+    clients: Union[Literal["ALL"], str, List[str]] = "ALL"
+    departments: Union[Literal["ALL"], str, List[str]] = "ALL"
+
+    years: Optional[List[int]] = None
+    months: Optional[List[int]] = None
+
+    headcounts: Union[Literal["ALL"], str, List[str]] = "ALL"   
+    shifts: Union[Literal["ALL"], str, List[str]] = "ALL"
+    top: Union[Literal["ALL"], str, int] = "ALL"
+
+    # Sorting (department view)
+    # Allowed: department | clients | headcount | total_allowance
+    sort_by: Optional[str] = "total_allowance"
+    sort_order: str = "default"  # default | asc | desc
+
+    # NEW: Allowance range filter (inclusive ranges)
+    # e.g., "1-10000" or ["80000-1100000"]
+    allowance: Optional[Union[str, List[str]]] = None
+
+    class Config:
+        extra = "forbid"

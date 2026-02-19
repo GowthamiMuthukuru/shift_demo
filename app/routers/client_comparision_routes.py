@@ -6,10 +6,10 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
 from db import get_db
 from schemas.displayschema import ClientDeptResponse
-from schemas.dashboardschema import ClientTotalAllowanceFilter,DashboardFilter,DashboardResponse
+from schemas.dashboardschema import ClientTotalAllowanceFilter,DashboardFilter,DashboardResponse,DeptDashboardFilter,DepartmentDashboardResponse
 from services.client_comparision_service import (client_comparison_service,
                                                  get_client_total_allowances,
-                                                 get_client_departments_service,get_client_dashboard)
+                                                 get_client_departments_service,get_client_dashboard,get_department_dashboard)
 from utils.dependencies import get_current_user
 from typing import Optional
 
@@ -79,3 +79,23 @@ def dashboard(
 
     return get_client_dashboard(db, filters)
 
+
+@router.post("/dashboard-Table-dept", response_model=DepartmentDashboardResponse)
+def dashboard_by_department(
+    filters: DeptDashboardFilter,
+    department_starts_with: Optional[str] = Query(
+        None, description="Filter departments starting with given prefix (e.g., 'Fin')"
+    ),
+    db: Session = Depends(get_db),
+    _current_user = Depends(get_current_user),
+):
+    """
+    Department-based dashboard:
+      - Aggregates by department.
+      - Returns department -> { clients, headcount, total_allowance }.
+      - Supports department_starts_with (only), not client_starts_with.
+    """
+    if department_starts_with:
+        filters.department_starts_with = department_starts_with
+
+    return get_department_dashboard(db, filters)

@@ -22,19 +22,19 @@ from __future__ import annotations
 from datetime import date
 from typing import List, Dict, Optional, Any, Tuple
 from sqlalchemy import literal
-from dateutil.relativedelta import relativedelta  # kept if you later add time windows
+from dateutil.relativedelta import relativedelta  
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
 from sqlalchemy import func, and_, or_, cast, Integer, extract
 
 from models.models import ShiftAllowances, ShiftMapping, ShiftsAmount
 from diskcache import Cache
-from utils.shift_config import get_all_shift_keys
+from utils.shift_config import get_all_shift_keys, get_shift_string
 
 cache = Cache("./diskcache/latest_month")
 
-# 🔄 Bump to invalidate caches generated under old latest-month behavior and zero-shift bug
-CLIENT_SUMMARY_VERSION = "v4"
+
+CLIENT_SUMMARY_VERSION = "v5"
 CACHE_TTL = 24 * 60 * 60  # 24 hours
 
 
@@ -150,7 +150,7 @@ def build_base_query(db: Session):
             ShiftAllowances.client_partner,   # str
             ShiftMapping.shift_type,          # str (e.g., PST_MST / US_INDIA / SG / ANZ)
             ShiftMapping.days,                # int
-            ShiftsAmount.amount,              # numeric (rate per day/year)
+            ShiftsAmount.amount,              # numeric 
         )
         .join(ShiftMapping, ShiftMapping.shiftallowance_id == ShiftAllowances.id)
         .outerjoin(
@@ -273,6 +273,89 @@ def resolve_target_months(
     return []
 
 
+def _build_shift_details_object(db: Session, months_to_use: List[date]) -> Dict[str, Dict[str, Any]]:
+    """
+    Returns:
+      {
+        "<SHIFT_KEY>": {
+          "label": "<Label from config first line or key>",
+          "timing": "<Timing from config second line (without parentheses) or ''>",
+          "amount": <float rate, chosen from latest year in selected months; otherwise latest available rate>
+        },
+        ...
+      }
+    """
+    keys = get_shift_keys()
+    out: Dict[str, Dict[str, Any]] = {}
+
+    # Determine years in scope
+    years_in_scope = sorted({d.year for d in months_to_use}) if months_to_use else []
+
+    # Fetch amounts for the relevant years (or all, if none provided)
+    q = db.query(ShiftsAmount)
+    if years_in_scope:
+        q = q.filter(cast(ShiftsAmount.payroll_year, Integer).in_(years_in_scope))
+    amount_rows = q.all()
+
+    # Build mapping: shift_key -> {year -> amount}
+    amounts_by_shift: Dict[str, Dict[int, float]] = {}
+    for r in amount_rows:
+        skey = clean_str(r.shift_type).upper()
+        try:
+            y = int(r.payroll_year) if r.payroll_year is not None else None
+        except Exception:
+            y = None
+        amt = float(r.amount or 0.0)
+        if skey and y:
+            amounts_by_shift.setdefault(skey, {})[y] = amt
+
+    # If some shift had no amount in selected years, fallback to latest across all years
+    if years_in_scope:
+        missing_keys = [k for k in keys if k not in amounts_by_shift or not amounts_by_shift[k]]
+        if missing_keys:
+            all_rows = db.query(ShiftsAmount).filter(
+                func.upper(func.trim(ShiftsAmount.shift_type)).in_(missing_keys)
+            ).all()
+            for r in all_rows:
+                skey = clean_str(r.shift_type).upper()
+                try:
+                    y = int(r.payroll_year) if r.payroll_year is not None else None
+                except Exception:
+                    y = None
+                amt = float(r.amount or 0.0)
+                if skey and y:
+                    amounts_by_shift.setdefault(skey, {}).setdefault(y, amt)
+
+    for k in keys:
+        # parse label/timing from config
+        s = (get_shift_string(k) or "").strip()
+        label, timing = k, ""
+        if s:
+            lines = s.splitlines()
+            if len(lines) >= 1:
+                label = lines[0].strip() or k
+            if len(lines) >= 2:
+                timing = lines[1].strip()
+                if timing.startswith("(") and timing.endswith(")"):
+                    timing = timing[1:-1].strip()
+
+        # pick amount: choose latest year in-scope; else latest overall; else 0.0
+        amount_map = amounts_by_shift.get(k, {})
+        chosen_amt: float = 0.0
+        if years_in_scope:
+            for y in sorted(years_in_scope, reverse=True):
+                if y in amount_map:
+                    chosen_amt = float(amount_map[y])
+                    break
+        if chosen_amt == 0.0 and amount_map:
+            latest_year = max(amount_map.keys())
+            chosen_amt = float(amount_map[latest_year])
+
+        out[k] = {"label": label, "timing": timing, "amount": chosen_amt}
+
+    return out
+
+
 def client_summary_service(db: Session, payload: dict):
     payload = payload or {}
     shift_keys = get_shift_keys()
@@ -322,9 +405,11 @@ def client_summary_service(db: Session, payload: dict):
     )
 
     if not months_to_use:
+        # Add shift_details even if empty months
         return {
             "periods": {},
-            "meta": {"message": "No data found for the selected filters."}
+            "meta": {"message": "No data found for the selected filters."},
+            "shift_details": _build_shift_details_object(db, months_to_use),
         }
 
     latest_style_request = not payload.get("years") and not payload.get("months")
@@ -337,12 +422,18 @@ def client_summary_service(db: Session, payload: dict):
             "client_partner": payload.get("client_partner"),
             "shifts": payload.get("shifts", "ALL"),
             "headcounts": payload.get("headcounts", "ALL"),
-            "sort_by": payload.get("sort_by", "client_total"),       
-            "sort_order": payload.get("sort_order", "desc"),  
+            "sort_by": payload.get("sort_by", "client_total"),
+            "sort_order": payload.get("sort_order", "desc"),
         }
         response_cache_key = f"client_summary_latest:{CLIENT_SUMMARY_VERSION}:{str(parts)}:response"
         cached_resp = cache.get(response_cache_key)
         if cached_resp:
+           
+            if "shift_details" not in cached_resp:
+                fixed = dict(cached_resp)
+                fixed["shift_details"] = _build_shift_details_object(db, months_to_use)
+                cache.set(response_cache_key, fixed, expire=CACHE_TTL)
+                return fixed
             return cached_resp
 
     query = build_base_query(db)
@@ -503,7 +594,7 @@ def client_summary_service(db: Session, payload: dict):
 
         month_data["clients"] = filtered_clients
 
-      
+        
         sort_by = payload.get("sort_by", "client_total")
         sort_order = str(payload.get("sort_order", "desc")).lower()
         reverse = sort_order != "asc"
@@ -537,6 +628,9 @@ def client_summary_service(db: Session, payload: dict):
             month_total[k] = sum(c[k] for c in month_data["clients"].values())
         month_total["total_head_count"] = sum(c["client_head_count"] for c in month_data["clients"].values())
         month_total["total_allowance"] = sum(c["client_total"] for c in month_data["clients"].values())
+
+   
+    aggregated["shift_details"] = _build_shift_details_object(db, months_to_use)
 
     if latest_style_request and response_cache_key:
         cache.set(response_cache_key, aggregated, expire=CACHE_TTL)

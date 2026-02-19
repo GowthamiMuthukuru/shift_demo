@@ -9,10 +9,11 @@ from dateutil.relativedelta import relativedelta
 from sqlalchemy import func,extract,Integer,or_,tuple_,and_,cast,desc
 from models.models import ShiftAllowances, ShiftsAmount, ShiftMapping
 from utils.client_enums import Company
-from schemas.dashboardschema import DashboardFilterRequest
+from schemas.dashboardschema import DashboardFilterRequest,DepartmentAnalyticsRequest
 import calendar
 from utils.shift_config import get_all_shift_keys  
-from collections import defaultdict
+from collections import defaultdict,OrderedDict
+from utils.shift_config import SHIFT_TYPES,get_shift_string
 
 def validate_month_format(month: str):
     """Validate and parse a YYYY-MM month string into a date."""
@@ -1754,28 +1755,121 @@ def _pick_nearest_baseline(
                 }
                 break
     return baselines
+
+
+def _group_selected_periods(pairs: List[Tuple[int, int]]) -> List[Dict[str, Any]]:
+    by_year: Dict[int, Set[int]] = {}
+    for y, m in pairs:
+        by_year.setdefault(y, set()).add(m)
+    return [{"year": y, "months": sorted(ms)} for y, ms in sorted(by_year.items())]
+
+
+def _extract_eid(emp_id: Any, emp_name: Any, client: str, dept: str, cp: str) -> str:
+    """
+    Unique employee key with fallback when emp_id is blank.
+    Ensures headcount is counted reliably.
+    """
+    e = clean_str(emp_id)
+    if e:
+        return e
+    return f"{clean_str(emp_name)}|{client}|{dept}|{cp}"
+
+
+def _build_shift_details_object_with_currency(db: Session, pairs: List[Tuple[int, int]], currency: str = "INR") -> Dict[str, Dict[str, Any]]:
+    """
+    Build { SHIFT_KEY: {label, timing, amount, currency} }:
+      - label/timing from get_shift_string()
+      - amount from ShiftsAmount:
+          * prefer the latest year present in selected periods (pairs)
+          * fallback to latest available year if selected years have no rows
+    """
+    keys = [str(k).strip().upper() for k in get_all_shift_keys()]
+    years_in_scope = sorted({y for y, _ in (pairs or [])})
+
+    q = db.query(ShiftsAmount)
+    if years_in_scope:
+        q = q.filter(cast(ShiftsAmount.payroll_year, Integer).in_(years_in_scope))
+    amount_rows = q.all()
+
+    # SHIFT -> { year -> amount }
+    amounts_by_shift: Dict[str, Dict[int, float]] = {}
+    for r in amount_rows:
+        skey = (str(r.shift_type) or "").strip().upper()
+        try:
+            yr = int(r.payroll_year) if r.payroll_year is not None else None
+        except Exception:
+            yr = None
+        amt = float(r.amount or 0.0)
+        if skey and yr:
+            amounts_by_shift.setdefault(skey, {})[yr] = amt
+
+    # Fallback for shifts with no rates in selected years
+    if years_in_scope:
+        missing = [k for k in keys if (k not in amounts_by_shift or not amounts_by_shift[k])]
+        if missing:
+            add_rows = db.query(ShiftsAmount).filter(
+                func.upper(func.trim(ShiftsAmount.shift_type)).in_(missing)
+            ).all()
+            for r in add_rows:
+                skey = (str(r.shift_type) or "").strip().upper()
+                try:
+                    yr = int(r.payroll_year) if r.payroll_year is not None else None
+                except Exception:
+                    yr = None
+                amt = float(r.amount or 0.0)
+                if skey and yr:
+                    amounts_by_shift.setdefault(skey, {}).setdefault(yr, amt)
+
+    out: Dict[str, Dict[str, Any]] = {}
+    for key in keys:
+        # label / timing
+        s = (get_shift_string(key) or "").strip()
+        label, timing = key, ""
+        if s:
+            lines = s.splitlines()
+            if len(lines) >= 1:
+                label = (lines[0] or "").strip() or key
+            if len(lines) >= 2:
+                timing = (lines[1] or "").strip()
+                if timing.startswith("(") and timing.endswith(")"):
+                    timing = timing[1:-1].strip()
+
+        # choose amount; prefer latest in-scope, else latest overall
+        yr_map = amounts_by_shift.get(key, {})
+        chosen = 0.0
+        if years_in_scope:
+            for y in sorted(years_in_scope, reverse=True):
+                if y in yr_map:
+                    chosen = float(yr_map[y])
+                    break
+        if chosen == 0.0 and yr_map:
+            chosen = float(yr_map[max(yr_map.keys())])
+
+        out[key] = {"label": label, "timing": timing, "amount": chosen, "currency": currency}
+
+    return out
+
+
 def client_analytics_service(db: Session, payload: dict) -> Dict[str, Any]:
     """
-    Client analytics service with drilldown,
-    partner-level breakdown, employee-level shift totals,
-    and department-level allowance summary.
+    Client-anchored analytics with deep nesting and shift meta.
 
-    - Previous month metrics are calculated ONLY for the selected drilldown client.
-    - Adds client_partner_count in client summary.
+
     """
-
     payload = _payload_to_plain_dict(payload)
 
-    clients_filter = parse_clients(payload.get("clients", "ALL"))
-    depts_filter = parse_departments(payload.get("departments", "ALL"))
-    shifts_filter = parse_shifts(payload.get("shifts", "ALL"))
-    top_n = parse_top(payload.get("top", "ALL"))
-    employee_cap = parse_employee_limit(payload.get("headcounts", "ALL"))
-    sort_by = parse_sort_by(payload.get("sort_by", ""))
-    sort_order = parse_sort_order(payload.get("sort_order", "default"))
+    # ---- Parse filters / controls
+    clients_filter    = parse_clients(payload.get("clients", "ALL"))
+    depts_filter      = parse_departments(payload.get("departments", "ALL"))
+    shifts_filter     = parse_shifts(payload.get("shifts", "ALL"))              # Set[str] or None
+    top_n             = parse_top(payload.get("top", "ALL"))                    # keep your existing 'top' behavior
+    employee_cap      = parse_employee_limit(payload.get("headcounts", "ALL"))  # optional employee list cap
+    sort_by           = parse_sort_by(payload.get("sort_by", ""))               # client | headcount | total_allowance | departments
+    sort_order        = parse_sort_order(payload.get("sort_order", "default"))  # default|asc|desc
 
-  
+    # ---- Resolve periods
     pairs, period_message = validate_years_months(payload, db=db)
+    periods = [f"{y:04d}-{m:02d}" for y, m in pairs]
 
     if not pairs:
         return {
@@ -1788,24 +1882,761 @@ def client_analytics_service(db: Session, payload: dict) -> Dict[str, Any]:
                 "total_allowance": 0.0,
             },
             "clients": {},
+            "shift_details": _build_shift_details_object_with_currency(db, []),
         }
 
-    periods = [f"{y:04d}-{m:02d}" for y, m in pairs]
-    drilldown_client = clients_filter[0] if clients_filter and len(clients_filter) == 1 else None
-
+    # ---- Base filters
     base_filters_extra: List[Any] = []
-
     if clients_filter:
         base_filters_extra.append(
             func.lower(func.trim(ShiftAllowances.client)).in_([c.lower() for c in clients_filter])
         )
-
     if depts_filter:
         base_filters_extra.append(
             func.lower(func.trim(ShiftAllowances.department)).in_([d.lower() for d in depts_filter])
         )
 
-    yr_month_filters_selected = [
+    ym_filters = [
+        and_(
+            extract("year",  ShiftAllowances.duration_month) == y,
+            extract("month", ShiftAllowances.duration_month) == m,
+        )
+        for y, m in pairs
+    ]
+
+    # ---- Query rows (days x rate applied below)
+    ShiftsAmountAlias = aliased(ShiftsAmount)
+    rows_q = (
+        db.query(
+            ShiftAllowances.emp_id,          # 0
+            ShiftAllowances.emp_name,        # 1
+            ShiftAllowances.client,          # 2
+            ShiftAllowances.department,      # 3
+            ShiftAllowances.client_partner,  # 4
+            ShiftMapping.shift_type,         # 5
+            ShiftMapping.days,               # 6
+            func.coalesce(ShiftsAmountAlias.amount, 0),  # 7
+        )
+        .select_from(ShiftAllowances)
+        .join(ShiftMapping, ShiftMapping.shiftallowance_id == ShiftAllowances.id)
+        .outerjoin(
+            ShiftsAmountAlias,
+            and_(
+                cast(ShiftsAmountAlias.payroll_year, Integer) == extract("year", ShiftAllowances.duration_month),
+                func.upper(func.trim(ShiftMapping.shift_type)) == func.upper(func.trim(ShiftsAmountAlias.shift_type)),
+            ),
+        )
+        .filter(or_(*ym_filters))
+        .filter(*base_filters_extra)
+    )
+    if shifts_filter:
+        rows_q = rows_q.filter(func.upper(func.trim(ShiftMapping.shift_type)).in_(list(shifts_filter)))
+
+    rows = rows_q.all()
+    if not rows:
+        return {
+            "periods": periods,
+            "message": period_message,
+            "summary": {
+                "total_clients": 0,
+                "departments": 0,
+                "headcount": 0,
+                "total_allowance": 0.0,
+            },
+            "clients": {},
+            "shift_details": _build_shift_details_object_with_currency(db, pairs),
+        }
+
+    SHIFT_KEYS = [str(k).strip().upper() for k in get_all_shift_keys()]
+    SHIFT_KEY_SET = set(SHIFT_KEYS)
+
+    # ------------------------------------------------------------------
+    # Aggregate: client → department → partner → employees
+    # Also track per-shift totals at each node.
+    # ------------------------------------------------------------------
+    clients_map: Dict[str, Dict[str, Any]] = {}   # client -> node
+    global_emp_set: Set[str] = set()
+    global_dept_set: Set[str] = set()
+    global_total = 0.0
+
+    for emp_id, emp_name, client, dept, cp, stype, days, rate in rows:
+        client_name = clean_str(client) or "Unknown"
+        dept_name   = clean_str(dept) or "Unknown"
+        partner     = clean_str(cp) or "Unknown"
+        st          = (clean_str(stype) or "").upper()
+        if st and SHIFT_KEY_SET and st not in SHIFT_KEY_SET:
+            continue
+
+        allowance = float(days or 0) * float(rate or 0)
+        eid = _extract_eid(emp_id, emp_name, client_name, dept_name, partner)
+
+        # init client node
+        cnode = clients_map.setdefault(
+            client_name,
+            {
+                "_emp_set": set(),
+                "_dept_set": set(),
+                "total_allowance": 0.0,
+                "shifts_summary": {k: 0.0 for k in SHIFT_KEYS},
+                "departments_breakdown": {}
+            }
+        )
+        cnode["_emp_set"].add(eid)
+        cnode["_dept_set"].add(dept_name)
+        cnode["total_allowance"] += allowance
+        if st in cnode["shifts_summary"]:
+            cnode["shifts_summary"][st] += allowance
+
+        # department node under client
+        dnode = cnode["departments_breakdown"].setdefault(
+            dept_name,
+            {
+                "_emp_set": set(),
+                "_partner_set": set(),
+                "total_allowance": 0.0,
+                "shifts_summary": {k: 0.0 for k in SHIFT_KEYS},
+                "client_partners": {}
+            }
+        )
+        dnode["_emp_set"].add(eid)
+        dnode["_partner_set"].add(partner)
+        dnode["total_allowance"] += allowance
+        if st in dnode["shifts_summary"]:
+            dnode["shifts_summary"][st] += allowance
+
+        # partner node under department
+        pnode = dnode["client_partners"].setdefault(
+            partner,
+            {
+                "_emp_set": set(),
+                "total_allowance": 0.0,
+                "shifts_summary": {k: 0.0 for k in SHIFT_KEYS},
+                "_employees": {}  # eid -> employee row with per-shift
+            }
+        )
+        pnode["_emp_set"].add(eid)
+        pnode["total_allowance"] += allowance
+        if st in pnode["shifts_summary"]:
+            pnode["shifts_summary"][st] += allowance
+
+        # employee accumulation under partner
+        erow = pnode["_employees"].get(eid)
+        if not erow:
+            erow = {
+                "emp_id": clean_str(emp_id),
+                "emp_name": clean_str(emp_name),
+                "client": client_name,
+                "client_partner": partner,
+                **{k: 0.0 for k in SHIFT_KEYS},
+                "total_allowance": 0.0
+            }
+            pnode["_employees"][eid] = erow
+        if st in erow:
+            erow[st] += allowance
+        erow["total_allowance"] += allowance
+
+        # global tallies
+        global_emp_set.add(eid)
+        global_dept_set.add(f"{client_name}|{dept_name}")  # unique client-dept pairs
+        global_total += allowance
+
+    # ------------------------------------------------------------------
+    # Build client items for sorting/top (keep your sorting behavior)
+    # ------------------------------------------------------------------
+    items: List[Dict[str, Any]] = []
+    for cname, cnode in clients_map.items():
+        items.append({
+            "client": cname,
+            "departments": len(cnode["_dept_set"]),
+            "headcount": len(cnode["_emp_set"]),
+            "total_allowance": round(float(cnode["total_allowance"]), 2),
+        })
+
+    # ---- Sorting (using your sort_by / sort_order semantics)
+    # Map values:
+    #   sort_by: client | departments | headcount | total_allowance (others fallback to total_allowance)
+    #   sort_order: asc | desc | default (default => numeric desc, alpha asc)
+    field_kind = {
+        "client": "alpha",
+        "departments": "num",
+        "headcount": "num",
+        "total_allowance": "num",
+    }
+    sb = (sort_by or "").strip().lower()
+    if sb not in field_kind:
+        sb = "total_allowance"
+
+    so = (sort_order or "default").strip().lower()
+    if so not in ("asc", "desc"):
+        effective_order = "desc" if field_kind[sb] == "num" else "asc"
+    else:
+        effective_order = so
+    reverse = (effective_order == "desc")
+
+    def _alpha(v: Any) -> str:
+        return (str(v or "")).lower()
+
+    def _num(v: Any) -> float:
+        try:
+            return float(v if v is not None else 0)
+        except Exception:
+            return 0.0
+
+    def sort_key(it: Dict[str, Any]):
+        v = it.get(sb)
+        if field_kind[sb] == "num":
+            return (_num(v), _alpha(it.get("client")))
+        else:
+            return (_alpha(v), _num(it.get("total_allowance")))
+
+    items.sort(key=sort_key, reverse=reverse)
+
+    # ---- Top N (clients)
+    if isinstance(top_n, int) and top_n > 0:
+        items = items[:top_n]
+
+    # ------------------------------------------------------------------
+    # Build final "clients" object
+    # ------------------------------------------------------------------
+    clients_out: Dict[str, Any] = OrderedDict()
+    for it in items:
+        cname = it["client"]
+        cnode = clients_map[cname]
+
+        # departments_breakdown
+        departments_out: Dict[str, Any] = OrderedDict()
+        for dname in sorted(cnode["departments_breakdown"].keys(), key=lambda s: s.lower()):
+            dnode = cnode["departments_breakdown"][dname]
+
+            # client partners
+            partners_out: Dict[str, Any] = OrderedDict()
+            for pname in sorted(dnode["client_partners"].keys(), key=lambda s: s.lower()):
+                pnode = dnode["client_partners"][pname]
+
+                employees_list = list(pnode["_employees"].values())
+                employees_list.sort(key=lambda x: x["total_allowance"], reverse=True)
+                if isinstance(employee_cap, int) and employee_cap > 0:
+                    employees_list = employees_list[:employee_cap]
+
+                partners_out[pname] = {
+                    "headcount": len(pnode["_emp_set"]),
+                    "total_allowance": round(float(pnode["total_allowance"]), 2),
+                    "shifts_summary": {k: round(float(v), 2) for k, v in pnode["shifts_summary"].items()},
+                    "employees": employees_list,
+                }
+
+            departments_out[dname] = {
+                "client_partner_count": len(dnode["_partner_set"]),
+                "headcount": len(dnode["_emp_set"]),
+                "total_allowance": round(float(dnode["total_allowance"]), 2),
+                "shifts_summary": {k: round(float(v), 2) for k, v in dnode["shifts_summary"].items()},
+                "client_partners": partners_out,
+            }
+
+        clients_out[cname] = {
+            "departments": it["departments"],
+            "headcount": it["headcount"],
+            "total_allowance": it["total_allowance"],
+            "shifts_summary": {k: round(float(v), 2) for k, v in cnode["shifts_summary"].items()},
+            "departments_breakdown": departments_out,
+        }
+
+    # ------------------------------------------------------------------
+    # Summary & response
+    # ------------------------------------------------------------------
+    result = {
+        "periods": periods,
+        "message": period_message or "",
+        "summary": {
+            "total_clients": len(clients_out),
+            "departments": len(set(global_dept_set)),  # unique client|dept pairs across all clients
+            "headcount": len(global_emp_set),
+            "total_allowance": round(float(global_total), 2),
+        },
+        "clients": clients_out,
+        "shift_details": _build_shift_details_object_with_currency(db, pairs, currency="INR"),
+    }
+
+    return result
+try:
+    # SHIFT_TYPES may be a dict mapping OR a set/list of codes in your project
+    from utils.shift_config import SHIFT_TYPES, get_all_shift_keys
+    SHIFT_KEYS: List[str] = [str(k).strip().upper() for k in get_all_shift_keys()]
+except Exception:
+    # Fallback: derive SHIFT_KEYS from SHIFT_TYPES if possible
+    try:
+        from utils.shift_config import SHIFT_TYPES  # type: ignore
+    except Exception:
+        SHIFT_TYPES = {}  # last-resort fallback (empty)
+    if isinstance(SHIFT_TYPES, dict):
+        SHIFT_KEYS = [str(k).strip().upper() for k in SHIFT_TYPES.keys()]
+    elif isinstance(SHIFT_TYPES, (set, list, tuple)):
+        SHIFT_KEYS = [str(k).strip().upper() for k in SHIFT_TYPES]
+    else:
+        SHIFT_KEYS = []
+SHIFT_KEY_SET: Set[str] = set(SHIFT_KEYS)
+
+def clean_str(value: Any) -> str:
+    """Normalize strings (handles None, whitespace, zero-width, nbsp, and quote-only)."""
+    if value is None:
+        return ""
+    s = value if isinstance(value, str) else str(value)
+    s = s.strip().replace("\u200b", "").replace("\u00a0", "").strip()
+    for _ in range(2):
+        if len(s) >= 2 and s[0] == s[-1] and s[0] in ("'", '"'):
+            s = s[1:-1].strip()
+    if s in ("'", "''", '"', '""'):
+        return ""
+    if s.upper() in ("NULL", "NONE", "NAN"):
+        return ""
+    return s
+
+
+def _is_all(value: Any) -> bool:
+    """True if value represents ALL."""
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return value.strip().upper() == "ALL"
+    if isinstance(value, list):
+        if len(value) == 0:
+            return True
+        if len(value) == 1 and str(value[0]).strip().upper() == "ALL":
+            return True
+    return False
+
+
+def _normalize_dash(s: str) -> str:
+    """Convert dash variants to standard '-'."""
+    return (s or "").replace("–", "-").replace("—", "-").replace("−", "-")
+
+
+def _as_list(x: Any) -> List[Any]:
+    """Return x as a list (None -> [], scalar -> [scalar], list -> list)."""
+    if x is None:
+        return []
+    return x if isinstance(x, list) else [x]
+
+
+def _payload_to_plain_dict(payload: Any) -> dict:
+    """Ensure payload is a plain dict (handles Pydantic v1/v2 and None)."""
+    if payload is None:
+        return {}
+    if isinstance(payload, dict):
+        return {k: v for k, v in payload.items() if v is not None}
+    if hasattr(payload, "model_dump"):  # Pydantic v2
+        try:
+            return payload.model_dump(exclude_none=True)
+        except Exception:
+            pass
+    if hasattr(payload, "dict"):  # Pydantic v1
+        try:
+            return payload.dict(exclude_none=True)
+        except Exception:
+            pass
+    try:
+        return dict(payload)
+    except Exception:
+        return {}
+
+# ======================================================================
+# PARSERS (filters, sorting, ranges)
+# ======================================================================
+
+def _coerce_int_list(values: Any, field_name: str, four_digit_year: bool = False) -> List[int]:
+    if values is None:
+        return []
+    if not isinstance(values, list):
+        raise HTTPException(status_code=400, detail=f"'{field_name}' must be a list.")
+    out: List[int] = []
+    for v in values:
+        if v is None:
+            continue
+        s = clean_str(v)
+        if not s:
+            continue
+        if four_digit_year and field_name == "years":
+            if not s.isdigit() or len(s) != 4:
+                raise HTTPException(400, "Invalid year. Year must be in YYYY format (e.g., 2024).")
+            y = int(s)
+            if y <= 0:
+                raise HTTPException(400, "Invalid year. Year must be a positive 4-digit number.")
+            out.append(y)
+            continue
+        try:
+            out.append(int(s))
+        except Exception:
+            raise HTTPException(400, f"Invalid value in '{field_name}': {v}")
+    return out
+
+
+def parse_clients(value: Any) -> Optional[List[str]]:
+    if _is_all(value):
+        return None
+    if isinstance(value, str):
+        v = clean_str(value)
+        return [v] if v else None
+    if isinstance(value, list):
+        out = [clean_str(x) for x in value if clean_str(x)]
+        return out or None
+    raise HTTPException(400, "clients must be 'ALL', string, or list.")
+
+
+def parse_departments(value: Any) -> Optional[List[str]]:
+    if _is_all(value):
+        return None
+    if isinstance(value, str):
+        v = clean_str(value)
+        return [v] if v else None
+    if isinstance(value, list):
+        out = [clean_str(x) for x in value if clean_str(x)]
+        return out or None
+    raise HTTPException(400, "departments must be 'ALL', string, or list.")
+
+
+def parse_shifts(value: Any) -> Optional[Set[str]]:
+    if _is_all(value):
+        return None
+    if isinstance(value, str):
+        v = clean_str(value).upper()
+        if SHIFT_KEY_SET and v not in SHIFT_KEY_SET:
+            raise HTTPException(400, f"Invalid shift type: {v}")
+        return {v}
+    if isinstance(value, list):
+        out: Set[str] = set()
+        for x in value:
+            v = clean_str(x).upper()
+            if not v:
+                continue
+            if SHIFT_KEY_SET and v not in SHIFT_KEY_SET:
+                raise HTTPException(400, f"Invalid shift type: {v}")
+            out.add(v)
+        return out or None
+    raise HTTPException(400, "shifts must be 'ALL', string, or list.")
+
+
+def parse_top(value: Any) -> Optional[int]:
+    if _is_all(value) or value is None:
+        return None
+    if isinstance(value, int):
+        if value <= 0:
+            raise HTTPException(400, "top must be > 0.")
+        return value
+    s = clean_str(value)
+    if s.isdigit():
+        iv = int(s)
+        if iv <= 0:
+            raise HTTPException(400, "top must be > 0.")
+        return iv
+    raise HTTPException(400, "top must be 'ALL' or a number.")
+
+
+def parse_employee_limit(value: Any) -> Optional[int]:
+    """
+    Headcounts behavior:
+    - "ALL" -> None
+    - "10" -> 10
+    - "1-10" -> 10
+    - ["1-10","11-50"] -> 50 (max upper bound)
+    Meaning: show up to N employees at the detailed list level.
+    """
+    if _is_all(value) or value is None:
+        return None
+    items = value if isinstance(value, list) else [value]
+    limits: List[int] = []
+    for item in items:
+        s = _normalize_dash(clean_str(item)).upper()
+        if not s or s == "ALL":
+            continue
+        if "-" in s:
+            lo, hi = [x.strip() for x in s.split("-", 1)]
+            if not lo.isdigit() or not hi.isdigit():
+                raise HTTPException(400, "Invalid headcount range.")
+            lo_i, hi_i = int(lo), int(hi)
+            if lo_i <= 0 or lo_i > hi_i:
+                raise HTTPException(400, "Invalid headcount range.")
+            limits.append(hi_i)
+        else:
+            if not s.isdigit() or int(s) <= 0:
+                raise HTTPException(400, "Invalid headcount value.")
+            limits.append(int(s))
+    return max(limits) if limits else None
+
+
+def parse_sort_order(value: Any) -> str:
+    v = clean_str(value).lower()
+    return v if v in ("default", "asc", "desc") else "default"
+
+
+def parse_sort_by_department(value: Any) -> str:
+    v = clean_str(value).lower()
+    allowed = {"department", "clients", "headcount", "total_allowance"}
+    return v if v in allowed else ""
+
+
+def apply_sort_dict_department(data: Dict[str, dict], sort_by: str, sort_order: str) -> Dict[str, dict]:
+    if sort_order == "default" or not sort_by:
+        return data
+    reverse = (sort_order == "desc")
+    if sort_by == "department":
+        return dict(sorted(data.items(), key=lambda kv: (kv[0] or "").lower(), reverse=reverse))
+    return dict(sorted(data.items(), key=lambda kv: kv[1].get(sort_by, 0) or 0, reverse=reverse))
+
+
+def parse_allowance_ranges(value: Any) -> Optional[List[tuple]]:
+    """
+    None/"ALL" -> None
+    "A-B" -> [(A,B)]
+    ["A-B", "C-D"] -> [(A,B), (C,D)]
+    """
+    if _is_all(value) or value is None:
+        return None
+    items = _as_list(value)
+    ranges: List[tuple] = []
+    for item in items:
+        s = _normalize_dash(clean_str(item))
+        if not s or "-" not in s:
+            raise HTTPException(400, f"Invalid allowance range: {item}. Use 'min-max'.")
+        lo_s, hi_s = [x.strip() for x in s.split("-", 1)]
+
+        def is_num(x: str) -> bool:
+            try:
+                float(x)
+                return True
+            except Exception:
+                return False
+
+        if not is_num(lo_s) or not is_num(hi_s):
+            raise HTTPException(400, f"Invalid allowance range: {item}. Use numeric 'min-max'.")
+        lo, hi = float(lo_s), float(hi_s)
+        if lo < 0 or hi < 0 or lo > hi:
+            raise HTTPException(400, f"Invalid allowance range (min <= max and non-negative): {item}")
+        ranges.append((lo, hi))
+    return ranges or None
+
+
+def allowance_in_ranges(total: float, ranges: Optional[List[tuple]]) -> bool:
+    if not ranges:
+        return True
+    return any(lo <= total <= hi for lo, hi in ranges)
+
+
+def top_n_dict(data: Dict[str, dict], n: Optional[int]) -> Dict[str, dict]:
+    if not n:
+        return data
+    return dict(list(data.items())[:n])
+
+
+
+def _find_recent_month_with_data(
+    db: Session, start_year: int, start_month: int, lookback: int = 12
+) -> Optional[Tuple[int, int]]:
+    y, m = start_year, start_month
+    for _ in range(lookback):
+        exists = db.query(ShiftAllowances.id).filter(
+            extract("year", ShiftAllowances.duration_month) == y,
+            extract("month", ShiftAllowances.duration_month) == m,
+        ).first()
+        if exists:
+            return (y, m)
+        if m == 1:
+            y, m = y - 1, 12
+        else:
+            m -= 1
+    return None
+
+
+def validate_years_months(payload: dict, db: Session) -> Tuple[List[Tuple[int, int]], Optional[str]]:
+    today = date.today()
+    cy, cm = today.year, today.month
+
+    payload = _payload_to_plain_dict(payload)
+    years_raw = payload.get("years")
+    months_raw = payload.get("months")
+
+    if _is_all(years_raw):
+        years_raw = None
+    if _is_all(months_raw):
+        months_raw = None
+
+    years = _coerce_int_list(_as_list(years_raw), "years", four_digit_year=True) if years_raw else []
+    months = _coerce_int_list(_as_list(months_raw), "months") if months_raw else []
+
+    pairs: List[Tuple[int, int]] = []
+    message: Optional[str] = None
+
+    if not years and not months:
+        exists_current = db.query(ShiftAllowances.id).filter(
+            extract("year", ShiftAllowances.duration_month) == cy,
+            extract("month", ShiftAllowances.duration_month) == cm,
+        ).first()
+        if exists_current:
+            pairs = [(cy, cm)]
+        else:
+            recent = _find_recent_month_with_data(db, cy, cm, lookback=12)
+            if recent:
+                ry, rm = recent
+                pairs = [(ry, rm)]
+                message = (
+                    f"No data for current month. Showing latest available month within last 12 months: {ry}-{rm:02d}."
+                )
+            else:
+                pairs = [(cy, cm)]
+                message = "No data found in the last 12 months. Defaulting to current month."
+    elif years and months:
+        for y in years:
+            for m in months:
+                pairs.append((y, m))
+    elif years:
+        for y in years:
+            for m in range(1, 13):
+                pairs.append((y, m))
+    elif months:
+        for m in months:
+            pairs.append((cy, m))
+
+    valid_pairs: List[Tuple[int, int]] = []
+    future_pairs: List[str] = []
+    for y, m in pairs:
+        if y > cy or (y == cy and m > cm):
+            future_pairs.append(f"{y}-{m:02d}")
+        else:
+            valid_pairs.append((y, m))
+
+    if future_pairs:
+        msg = f"Future periods ignored: {', '.join(sorted(set(future_pairs)))}"
+        message = f"{message} {msg}".strip() if message else msg
+
+    if (years or months) and not valid_pairs:
+        return [], message
+
+    return sorted(set(valid_pairs)), message
+
+
+def _build_shift_details_from_config(shift_types_obj: Any) -> Dict[str, Dict[str, Any]]:
+    """
+    Accepts either:
+      - dict mapping: { "PST_MST": "PST/MST\\n(07 PM - 06 AM)\\nINR 700", ... }
+      - iterable of keys: {"PST_MST", "US_INDIA", ...}
+    Returns:
+      {
+        "PST_MST": {
+          "label": "PST/MST" or "PST_MST",
+          "timing": "07 PM - 06 AM" or None,
+          "amount": 700 or None,
+          "currency": "INR" or None
+        },
+        ...
+      }
+    """
+    out: Dict[str, Dict[str, Any]] = {}
+    if isinstance(shift_types_obj, dict):
+        for key, blob in shift_types_obj.items():
+            lines = str(blob).splitlines()
+            label = clean_str(lines[0]) if len(lines) >= 1 else clean_str(key)
+            timing_raw = clean_str(lines[1]) if len(lines) >= 2 else ""
+            timing = timing_raw.strip("()") if timing_raw else None
+
+            amount_raw = clean_str(lines[2]) if len(lines) >= 3 else ""
+            currency: Optional[str] = None
+            amount_val: Optional[float] = None
+            if amount_raw:
+                parts = amount_raw.split()
+                if len(parts) >= 2 and parts[0].isalpha():
+                    currency = parts[0]
+                    try:
+                        amount_val = float(parts[1].replace(",", ""))
+                    except Exception:
+                        amount_val = None
+                else:
+                    for p in parts:
+                        try:
+                            amount_val = float(p.replace(",", ""))
+                            break
+                        except Exception:
+                            continue
+                    if "INR" in amount_raw.upper():
+                        currency = "INR"
+
+            out[key] = {
+                "label": label or key,
+                "timing": timing,
+                "amount": int(amount_val) if isinstance(amount_val, float) and amount_val.is_integer() else amount_val,
+                "currency": currency,
+            }
+        return out
+
+    if isinstance(shift_types_obj, (set, list, tuple)):
+        for key in shift_types_obj:
+            skey = clean_str(key)
+            out[skey] = {"label": skey, "timing": None, "amount": None, "currency": None}
+        return out
+
+    return out
+
+
+
+def department_analytics_service(db: Session, payload: DepartmentAnalyticsRequest) -> Dict[str, Any]:
+    """
+    Department analytics:
+      - Aggregate by department
+      - Drilldown (only if exactly one department is selected): clients -> client_partners
+      - Sorting numeric/alphabetic
+      - Allowance range filter (inclusive)
+      - No "starts with" filters
+      - OPTION A: Employees only under partners (omit client-level employees when partners exist)
+      - Adds top-level 'shift_details' parsed from SHIFT_TYPES (imported, not hardcoded)
+    """
+    payload_dict = _payload_to_plain_dict(payload)
+
+    clients_filter = parse_clients(payload_dict.get("clients", "ALL"))
+    depts_filter = parse_departments(payload_dict.get("departments", "ALL"))
+    shifts_filter = parse_shifts(payload_dict.get("shifts", "ALL"))
+    top_n = parse_top(payload_dict.get("top", "ALL"))
+    employee_cap = parse_employee_limit(payload_dict.get("headcounts", "ALL"))
+    sort_by = parse_sort_by_department(payload_dict.get("sort_by", ""))
+    sort_order = parse_sort_order(payload_dict.get("sort_order", "default"))
+    allowance_ranges = parse_allowance_ranges(payload_dict.get("allowance"))
+
+    # Periods
+    pairs, period_message = validate_years_months(payload_dict, db=db)
+    periods = [f"{y:04d}-{m:02d}" for y, m in pairs]
+
+    # Shift details (from config)
+    shift_details = _build_shift_details_from_config(SHIFT_TYPES)
+
+    if not pairs:
+        return {
+            "periods": [],
+            "message": period_message,
+            "summary": {
+                "total_departments": 0,
+                "clients": 0,
+                "headcount": 0,
+                "total_allowance": 0.0,
+            },
+            "departments": {},
+            "shift_details": shift_details,
+        }
+
+    # Drilldown if exactly one department selected
+    drilldown_dept = None
+    if depts_filter and len(depts_filter) == 1:
+        drilldown_dept = depts_filter[0]
+
+    # Base filters (exact only)
+    base_filters_extra: List[Any] = []
+    if clients_filter:
+        base_filters_extra.append(
+            func.lower(func.trim(ShiftAllowances.client)).in_([c.lower() for c in clients_filter])
+        )
+    if depts_filter:
+        base_filters_extra.append(
+            func.lower(func.trim(ShiftAllowances.department)).in_([d.lower() for d in depts_filter])
+        )
+
+    # Period filter
+    ym_filters = [
         and_(
             extract("year", ShiftAllowances.duration_month) == y,
             extract("month", ShiftAllowances.duration_month) == m,
@@ -1835,13 +2666,11 @@ def client_analytics_service(db: Session, payload: dict) -> Dict[str, Any]:
                 func.upper(func.trim(ShiftMapping.shift_type)) == func.upper(func.trim(ShiftsAmountAlias.shift_type)),
             ),
         )
-        .filter(or_(*yr_month_filters_selected))
+        .filter(or_(*ym_filters))
         .filter(*base_filters_extra)
     )
-
     if shifts_filter:
         rows_q = rows_q.filter(func.upper(func.trim(ShiftMapping.shift_type)).in_(list(shifts_filter)))
-
     rows = rows_q.all()
 
     if not rows:
@@ -1849,56 +2678,25 @@ def client_analytics_service(db: Session, payload: dict) -> Dict[str, Any]:
             "periods": periods,
             "message": period_message,
             "summary": {
-                "total_clients": 0,
-                "departments": 0,
+                "total_departments": 0,
+                "clients": 0,
                 "headcount": 0,
                 "total_allowance": 0.0,
             },
-            "clients": {},
+            "departments": {},
+            "shift_details": shift_details,
         }
 
-
-    latest_y, latest_m = sorted(pairs)[-1]
-    prev_y, prev_m = (latest_y - 1, 12) if latest_m == 1 else (latest_y, latest_m - 1)
-
-    prev_rows_q = (
-        db.query(
-            ShiftAllowances.emp_id,
-            ShiftAllowances.client,
-            ShiftMapping.days,
-            func.coalesce(ShiftsAmountAlias.amount, 0),
-        )
-        .select_from(ShiftAllowances)
-        .join(ShiftMapping, ShiftMapping.shiftallowance_id == ShiftAllowances.id)
-        .outerjoin(
-            ShiftsAmountAlias,
-            and_(
-                cast(ShiftsAmountAlias.payroll_year, Integer) == extract("year", ShiftAllowances.duration_month),
-                func.upper(func.trim(ShiftMapping.shift_type)) == func.upper(func.trim(ShiftsAmountAlias.shift_type)),
-            ),
-        )
-        .filter(
-            extract("year", ShiftAllowances.duration_month) == prev_y,
-            extract("month", ShiftAllowances.duration_month) == prev_m,
-            *base_filters_extra
-        )
-    )
-
-    if shifts_filter:
-        prev_rows_q = prev_rows_q.filter(func.upper(func.trim(ShiftMapping.shift_type)).in_(list(shifts_filter)))
-
-    prev_rows = prev_rows_q.all()
-
-
-    client_nodes: Dict[str, Dict[str, Any]] = {}
-    partners: Dict[str, Dict[str, Any]] = {}
-    employees_global: Dict[str, Dict[str, Any]] = {}
-    departments_by_client: Dict[str, Dict[str, float]] = {}
+    # Aggregation structures
+    dept_nodes: Dict[str, Dict[str, Any]] = {}
+    clients_map: Dict[str, Dict[str, Any]] = {}  # drilldown
+    partners_map: Dict[Tuple[str, str], Dict[str, Any]] = {}  # drilldown
+    employees_global: Dict[str, Dict[str, Any]] = {}  # dept-level shift summary
 
     for emp_id, emp_name, client, dept, cp, stype, days, amt in rows:
-        client_name = clean_str(client) or "UNKNOWN"
-        dept_name = clean_str(dept) or "UNKNOWN"
-        partner_name = clean_str(cp) or "UNKNOWN"
+        dname = clean_str(dept) or "UNKNOWN"
+        cname = clean_str(client) or "UNKNOWN"
+        cpname = clean_str(cp) or "UNKNOWN"
         eid = clean_str(emp_id)
         st = clean_str(stype).upper()
 
@@ -1907,64 +2705,92 @@ def client_analytics_service(db: Session, payload: dict) -> Dict[str, Any]:
 
         allowance = float(days or 0) * float(amt or 0)
 
-        cnode = client_nodes.setdefault(
-            client_name,
-            {"dept_set": set(), "emp_set": set(), "total_allowance": 0.0, "partners_set": set()},
-        )
-
-        cnode["dept_set"].add(dept_name)
-        cnode["partners_set"].add(partner_name)
+        # Department aggregation
+        dnode = dept_nodes.setdefault(dname, {"clients_set": set(), "emp_set": set(), "total_allowance": 0.0})
+        dnode["clients_set"].add(cname)
         if eid:
-            cnode["emp_set"].add(eid)
-        cnode["total_allowance"] += allowance
+            dnode["emp_set"].add(eid)
+        dnode["total_allowance"] += allowance
 
-        dept_map = departments_by_client.setdefault(client_name, {})
-        dept_map[dept_name] = dept_map.get(dept_name, 0.0) + allowance
-
-        if drilldown_client and client_name.lower() == drilldown_client.lower():
-            pnode = partners.setdefault(
-                partner_name,
+        # Drilldown population only for the selected department
+        if drilldown_dept and dname.lower() == drilldown_dept.lower():
+            # Client-level node
+            cnode = clients_map.setdefault(
+                cname,
                 {
-                    "dept_set": set(),
+                    "partners_set": set(),
                     "emp_set": set(),
                     "total_allowance": 0.0,
                     "shift_totals": {k: 0.0 for k in SHIFT_KEYS},
-                    "employees": {},
+                    "employees": {},  # eid -> employee totals (client level)
                 },
             )
-
-            pnode["dept_set"].add(dept_name)
+            cnode["partners_set"].add(cpname)
             if eid:
-                pnode["emp_set"].add(eid)
-            pnode["total_allowance"] += allowance
+                cnode["emp_set"].add(eid)
+            cnode["total_allowance"] += allowance
+            if st in cnode["shift_totals"]:
+                cnode["shift_totals"][st] += allowance
 
-            if st in pnode["shift_totals"]:
-                pnode["shift_totals"][st] += allowance
-
+            # Client-level employees (may be omitted in response if partners exist)
             if eid:
-                pe = pnode["employees"].get(eid)
+                pe = cnode["employees"].get(eid)
                 if not pe:
                     pe = {
                         "emp_id": eid,
                         "emp_name": clean_str(emp_name),
-                        "department": dept_name,
-                        "client_partner": partner_name,
+                        "client": cname,
+                        "client_partner": cpname,
                         **{k: 0.0 for k in SHIFT_KEYS},
                         "total_allowance": 0.0,
                     }
-                    pnode["employees"][eid] = pe
-
+                    cnode["employees"][eid] = pe
                 if st in pe:
                     pe[st] += allowance
                 pe["total_allowance"] += allowance
 
+            # Partner-level node
+            pnode = partners_map.setdefault(
+                (cname, cpname),
+                {
+                    "emp_set": set(),
+                    "total_allowance": 0.0,
+                    "shift_totals": {k: 0.0 for k in SHIFT_KEYS},
+                    "employees": {},  # eid -> employee totals (partner level)
+                },
+            )
+            if eid:
+                pnode["emp_set"].add(eid)
+            pnode["total_allowance"] += allowance
+            if st in pnode["shift_totals"]:
+                pnode["shift_totals"][st] += allowance
+
+            # Partner-level employees (Option A display source)
+            if eid:
+                pe_partner = pnode["employees"].get(eid)
+                if not pe_partner:
+                    pe_partner = {
+                        "emp_id": eid,
+                        "emp_name": clean_str(emp_name),
+                        "client": cname,
+                        "client_partner": cpname,
+                        **{k: 0.0 for k in SHIFT_KEYS},
+                        "total_allowance": 0.0,
+                    }
+                    pnode["employees"][eid] = pe_partner
+                if st in pe_partner:
+                    pe_partner[st] += allowance
+                pe_partner["total_allowance"] += allowance
+
+            # Dept-level shifts summary
+            if eid:
                 eg = employees_global.setdefault(
                     eid,
                     {
                         "emp_id": eid,
                         "emp_name": clean_str(emp_name),
-                        "department": dept_name,
-                        "client_partner": partner_name,
+                        "client": cname,
+                        "client_partner": cpname,
                         **{k: 0.0 for k in SHIFT_KEYS},
                         "total_allowance": 0.0,
                     },
@@ -1973,42 +2799,30 @@ def client_analytics_service(db: Session, payload: dict) -> Dict[str, Any]:
                     eg[st] += allowance
                 eg["total_allowance"] += allowance
 
-    
-    clients_out: Dict[str, Any] = {}
-    for cname, node in client_nodes.items():
-        client_obj: Dict[str, Any] = {
-            "departments": len(node["dept_set"]),
+    # Build departments (apply allowance ranges)
+    departments_out: Dict[str, Any] = {}
+    for dname, node in dept_nodes.items():
+        total_allow = round(node["total_allowance"], 2)
+        if not allowance_in_ranges(total_allow, allowance_ranges):
+            continue
+        departments_out[dname] = {
+            "clients": len(node["clients_set"]),
             "headcount": len(node["emp_set"]),
-            "total_allowance": round(node["total_allowance"], 2),
-            "client_partner_count": len(node["partners_set"]), 
+            "total_allowance": total_allow,
         }
 
-        
-        if drilldown_client and cname.lower() == drilldown_client.lower():
-            prev_rows_client = [r for r in prev_rows if clean_str(r[1]).lower() == cname.lower()]
-            prev_emp_set = set()
-            prev_total_allowance = 0.0
-            for emp_id, client, days, amt in prev_rows_client:
-                if emp_id:
-                    prev_emp_set.add(emp_id)
-                prev_total_allowance += float(days or 0) * float(amt or 0)
-
-            client_obj["headcount_last_month"] = len(prev_emp_set)
-            client_obj["total_allowance_last_month"] = round(prev_total_allowance, 2)
-
-        clients_out[cname] = client_obj
-
+    # Sorting & Top-N
     if sort_order != "default" and sort_by:
-        clients_out = apply_sort_dict(clients_out, sort_by, sort_order)
-    clients_out = top_n_dict(clients_out, top_n)
+        departments_out = apply_sort_dict_department(departments_out, sort_by, sort_order)
+    departments_out = top_n_dict(departments_out, top_n)
 
-   
-    overall_depts: Set[str] = set()
+    # Summary
+    overall_clients: Set[str] = set()
     overall_emps: Set[str] = set()
     total_allowance_sum = 0.0
-    for cname in clients_out:
-        node = client_nodes[cname]
-        overall_depts |= node["dept_set"]
+    for dname in departments_out:
+        node = dept_nodes[dname]
+        overall_clients |= node["clients_set"]
         overall_emps |= node["emp_set"]
         total_allowance_sum += node["total_allowance"]
 
@@ -2016,55 +2830,78 @@ def client_analytics_service(db: Session, payload: dict) -> Dict[str, Any]:
         "periods": periods,
         "message": period_message,
         "summary": {
-            "total_clients": len(clients_out),
-            "departments": len(overall_depts),
+            "total_departments": len(departments_out),
+            "clients": len(overall_clients),
             "headcount": len(overall_emps),
             "total_allowance": round(total_allowance_sum, 2),
         },
-        "clients": clients_out,
+        "departments": departments_out,
+        "shift_details": shift_details,  # from config (imported)
     }
 
-    if drilldown_client and drilldown_client in client_nodes:
-        selected_key = next(
-            (k for k in client_nodes if k.lower() == drilldown_client.lower()),
-            drilldown_client,
-        )
-        node = client_nodes[selected_key]
+    # Drilldown (only if exactly one department selected AND it survived filters)
+    if drilldown_dept:
+        selected_key = next((k for k in departments_out if k.lower() == drilldown_dept.lower()), None)
+        if selected_key:
+            dept_obj = result["departments"][selected_key]
 
-        client_obj: Dict[str, Any] = result["clients"][selected_key]
+            # Department-level shifts summary
+            shifts_summary = {k: 0.0 for k in SHIFT_KEYS}
+            for _eid, emp_data in employees_global.items():
+                for k in SHIFT_KEYS:
+                    shifts_summary[k] += emp_data.get(k, 0.0)
+            dept_obj["shifts_summary"] = {k: round(v, 2) for k, v in shifts_summary.items()}
 
-        dept_summary_raw = departments_by_client.get(selected_key, {})
-        client_obj["department_summary"] = {
-            dept: round(total, 2)
-            for dept, total in sorted(dept_summary_raw.items(), key=lambda x: x[1], reverse=True)
-        }
+            # clients -> client_partners (Option A behavior)
+            clients_out: Dict[str, Any] = {}
+            for cname, cnode in clients_map.items():
+                # Build partner collections first
+                partners_out: Dict[str, Any] = {}
+                for (client_key, partner_name), pnode in partners_map.items():
+                    if client_key != cname:
+                        continue
 
-   
-        shifts_summary = {k: 0.0 for k in SHIFT_KEYS}
-        for emp_id, emp_data in employees_global.items():
-            if emp_id not in node["emp_set"]:
-                continue
-            for k in SHIFT_KEYS:
-                shifts_summary[k] += emp_data.get(k, 0.0)
-        client_obj["shifts_summary"] = {k: round(v, 2) for k, v in shifts_summary.items()}
+                    partner_employees = list(pnode["employees"].values())
+                    if employee_cap:
+                        partner_employees = sorted(
+                            partner_employees, key=lambda x: x.get("total_allowance", 0.0), reverse=True
+                        )[:employee_cap]
 
-        partners_out: Dict[str, Any] = {}
-        for partner_name, pnode in partners.items():
-            employees_list = list(pnode["employees"].values())
-            if employee_cap:
-                employees_list = sorted(
-                    employees_list, key=lambda x: x["total_allowance"], reverse=True
-                )[:employee_cap]
+                    partners_out[partner_name] = {
+                        "headcount": len(pnode["emp_set"]),
+                        "total_allowance": round(pnode["total_allowance"], 2),
+                        "shifts_summary": {k: round(v, 2) for k, v in pnode["shift_totals"].items()},
+                        "employees": sorted(
+                            partner_employees, key=lambda x: x.get("total_allowance", 0.0), reverse=True
+                        ),
+                    }
 
-            partners_out[partner_name] = {
-                "departments": len(pnode["dept_set"]),
-                "headcount": len(pnode["emp_set"]),
-                "total_allowance": round(pnode["total_allowance"], 2),
-                "shifts_summary": {k: round(v, 2) for k, v in pnode["shift_totals"].items()},
-                "employees": sorted(employees_list, key=lambda x: x["total_allowance"], reverse=True),
-            }
+                # If partners exist, OMIT client-level employees to avoid duplication
+                has_partners = len(partners_out) > 0
 
-        client_obj["client_partners"] = partners_out
-        result["clients"][selected_key] = client_obj
+                client_obj = {
+                    "client_partner_count": len(cnode["partners_set"]),
+                    "headcount": len(cnode["emp_set"]),
+                    "total_allowance": round(cnode["total_allowance"], 2),
+                    "shifts_summary": {k: round(v, 2) for k, v in cnode["shift_totals"].items()},
+                    "client_partners": partners_out,
+                }
+
+                if not has_partners:
+                    # Only when there are NO partners, include client-level employees
+                    employees_list = list(cnode["employees"].values())
+                    if employee_cap:
+                        employees_list = sorted(
+                            employees_list, key=lambda x: x["total_allowance"], reverse=True
+                        )[:employee_cap]
+                    client_obj["employees"] = sorted(
+                        employees_list, key=lambda x: x["total_allowance"], reverse=True
+                    )
+
+                clients_out[cname] = client_obj
+
+            dept_obj["clients_breakdown"] = clients_out
+            result["departments"][selected_key] = dept_obj
 
     return result
+
