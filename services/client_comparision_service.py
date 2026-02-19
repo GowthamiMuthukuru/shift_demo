@@ -11,7 +11,7 @@ from sqlalchemy import func, and_
 from dateutil.relativedelta import relativedelta
 from models.models import ShiftAllowances, ShiftMapping, ShiftsAmount
 from utils.shift_config import get_all_shift_keys
-from schemas.dashboardschema import ClientTotalAllowanceFilter,DepartmentDashboardResponse,DashboardFilter,DeptDashboardFilter
+from schemas.dashboardschema import ClientTotalAllowanceFilter,DepartmentDashboardResponse,DashboardFilter,DeptDashboardFilter,DepartmentTotalAllowanceFilter
 from collections import OrderedDict
 
 import re
@@ -1639,3 +1639,254 @@ def get_department_dashboard(db: Session, filters: DeptDashboardFilter) -> Dict[
         "dashboard": dashboard,
     }
 
+def get_department_total_allowances(db: Session, filters: DepartmentTotalAllowanceFilter):
+    today = date.today()
+    current_year = today.year
+    current_month = today.month
+    messages: List[str] = []
+
+    raw_years = filters.years or []
+    raw_months = filters.months or []
+
+    if raw_years == [0]:
+        raw_years = []
+    if raw_months == [0]:
+        raw_months = []
+
+    years = _normalize_years(raw_years)
+    months = _normalize_months(raw_months)
+
+    base_query = db.query(ShiftAllowances)
+
+    # Client filter
+    if filters.clients != "ALL":
+        if isinstance(filters.clients, list):
+            base_query = base_query.filter(
+                ShiftAllowances.client.in_(filters.clients)
+            )
+        else:
+            base_query = base_query.filter(
+                ShiftAllowances.client == filters.clients
+            )
+
+    # Department filter
+    if filters.departments != "ALL":
+        if isinstance(filters.departments, list):
+            base_query = base_query.filter(
+                ShiftAllowances.department.in_(filters.departments)
+            )
+        else:
+            base_query = base_query.filter(
+                ShiftAllowances.department == filters.departments
+            )
+
+    # Default period logic (mirror of client endpoint)
+    if not years and not months:
+        current_exists = base_query.filter(
+            func.extract("year", ShiftAllowances.duration_month) == current_year,
+            func.extract("month", ShiftAllowances.duration_month) == current_month
+        ).first()
+
+        if current_exists:
+            years = [current_year]
+            months = [current_month]
+        else:
+            cutoff = today.replace(day=1) - relativedelta(months=12)
+            latest = (
+                base_query
+                .filter(ShiftAllowances.duration_month >= cutoff)
+                .order_by(ShiftAllowances.duration_month.desc())
+                .first()
+            )
+
+            if latest and latest.duration_month:
+                latest_date = latest.duration_month
+                years = [latest_date.year]
+                months = [latest_date.month]
+                messages.append(
+                    f"No data for current month. Showing latest available month: "
+                    f"{latest_date.month}-{latest_date.year}"
+                )
+            else:
+                years = [current_year]
+                months = [current_month]
+
+    elif months and not years:
+        years = [current_year]
+    elif years and not months:
+        months = list(range(1, 13))
+
+    # Apply year/month filters
+    q = base_query.filter(
+        func.extract("year", ShiftAllowances.duration_month).in_(years)
+    ).filter(
+        func.extract("month", ShiftAllowances.duration_month).in_(months)
+    )
+
+    # Employee filter (if present)
+    if getattr(filters, "emp_id", None):
+        emp_list = filters.emp_id if isinstance(filters.emp_id, list) else [filters.emp_id]
+        q = q.filter(
+            or_(*[
+                func.upper(ShiftAllowances.emp_id) == str(e).upper()
+                for e in emp_list
+            ])
+        )
+
+    # Client partner filter (if present)
+    if getattr(filters, "client_partner", None):
+        cp_list = filters.client_partner if isinstance(filters.client_partner, list) else [filters.client_partner]
+        q = q.filter(
+            or_(*[
+                func.upper(ShiftAllowances.client_partner).like(f"%{str(cp).upper()}%")
+                for cp in cp_list
+            ])
+        )
+
+    rows = q.all()
+
+    # Load shift rates
+    rate_rows = db.query(ShiftsAmount).all()
+    rates = {
+        str(r.shift_type).upper(): Decimal(r.amount or 0)
+        for r in rate_rows
+    }
+
+    allowed_shifts: Optional[Set[str]] = _normalize_shifts_filter(
+        getattr(filters, "shifts", None)
+    )
+
+    
+    dept_totals: Dict[str, Decimal] = defaultdict(lambda: Decimal(0))
+    dept_emps: Dict[str, set] = defaultdict(set)                # unique emp ids per dept
+    dept_clients: Dict[str, set] = defaultdict(set)             # unique clients per dept
+    dept_shifts: Dict[str, Dict[str, Decimal]] = defaultdict(lambda: defaultdict(lambda: Decimal(0)))
+    dept_clients_breakdown: Dict[str, Dict[str, Dict[str, Any]]] = defaultdict(
+        lambda: defaultdict(
+            lambda: {
+                "total": Decimal(0),
+                "shifts": defaultdict(lambda: Decimal(0)),
+                "emp_ids": set()
+            }
+        )
+    )
+
+    for row in rows:
+        dept = row.department or "Unknown"
+        client = row.client or "Unknown"
+        emp = str(row.emp_id) if row.emp_id else None
+
+        mappings = getattr(row, "shift_mappings", []) or []
+        row_contributed = False
+
+        for mapping in mappings:
+            shift_key = str(mapping.shift_type or "").upper()
+            days = Decimal(mapping.days or 0)
+
+            if days <= 0:
+                continue
+
+            if allowed_shifts and shift_key not in allowed_shifts:
+                continue
+
+            rate = rates.get(shift_key, Decimal(0))
+            amount = days * rate
+
+            if amount <= 0:
+                continue
+
+            dept_totals[dept] += amount
+            dept_shifts[dept][shift_key] += amount
+            dept_clients[dept].add(client)
+
+            # per-dept client breakdown
+            dept_clients_breakdown[dept][client]["total"] += amount
+            dept_clients_breakdown[dept][client]["shifts"][shift_key] += amount
+
+            row_contributed = True
+
+        if row_contributed and emp:
+            dept_emps[dept].add(emp)
+            dept_clients_breakdown[dept][client]["emp_ids"].add(emp)
+
+    # Headcount filter at DEPARTMENT level
+    headcount_rules = _parse_headcount_filter(
+        getattr(filters, "headcounts", None)
+    )
+
+    
+    result: List[Dict[str, Any]] = []
+
+    for dept, total in dept_totals.items():
+        headcount = len(dept_emps.get(dept, set()))
+        if not _headcount_matches(headcount, headcount_rules):
+            continue
+
+        shifts_out = {
+            k: float(v)
+            for k, v in dept_shifts.get(dept, {}).items()
+            if v > 0
+        }
+
+        # Optional clients breakdown (handy for drilldown or tooltips)
+        clients_out = []
+        for cname, crec in dept_clients_breakdown[dept].items():
+            c_head = len(crec["emp_ids"])
+            c_total = float(crec["total"])
+            c_shifts = {sk: float(av) for sk, av in crec["shifts"].items() if av > 0}
+
+            if c_total > 0:
+                clients_out.append({
+                    "client": cname,
+                    "headcount": c_head,
+                    "total_allowance": c_total,
+                    "shifts": c_shifts
+                })
+
+        result.append({
+            "department": dept,
+            "display_name": dept,  # for UI consistency if you expect this key
+            "clients": len(dept_clients.get(dept, set())),
+            "headcount": headcount,
+            "total_allowance": float(total),
+            "shifts": shifts_out,
+            "clients_breakdown": clients_out
+        })
+
+   
+    sort_by_key = getattr(filters, "sort_by", "total_allowance")
+    sort_order_in = getattr(filters, "sort_order", "default").lower()
+
+    # For numeric fields default to desc; for alpha default to asc
+    if sort_by_key in ("total_allowance", "clients", "headcount"):
+        reverse = (sort_order_in != "asc")  # default/desc -> True
+        result.sort(
+            key=lambda x: x.get(sort_by_key, 0),
+            reverse=reverse
+        )
+    else:
+        # 'department' alpha
+        reverse = (sort_order_in == "desc")
+        result.sort(
+            key=lambda x: (x.get("department") or "").lower(),
+            reverse=reverse
+        )
+
+  
+    top_value = getattr(filters, "top", None)
+    if top_value and str(top_value).lower() != "all":
+        if not str(top_value).isdigit() or int(top_value) <= 0:
+            raise HTTPException(
+                status_code=400,
+                detail="top must be positive integer or ALL"
+            )
+        result = result[:int(top_value)]
+
+    if not result and not messages:
+        messages.append("No data found for selected periods.")
+
+    return {
+        "selected_periods": [{"year": y, "months": months} for y in years],
+        "messages": messages,
+        "data": result
+    }

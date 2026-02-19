@@ -142,12 +142,31 @@ class ClientAnalyticsRequest(BaseModel):
     shifts: Union[Literal["ALL"], str, List[str]] = "ALL"
     top: Union[Literal["ALL"], str, int] = "ALL"
 
-    sort_by: Optional[SortBy] = "total_allowance"
-    sort_order: SortOrder = "default"
+    # Existing (client-level fallback)
+    sort_by: Optional["SortBy"] = "total_allowance"  # type: ignore[name-defined]
+    sort_order: "SortOrder" = "default"              # type: ignore[name-defined]
+
+    # New (granular; all optional and backward-compatible)
+    # Clients level: client|departments|headcount|total_allowance|shift:<KEY>/<KEY>
+    sort_clients_by: Optional[str] = None
+    sort_clients_order: Optional[str] = None  # asc|desc|default
+
+    # Departments level (DEFAULT -> total_allowance):
+    # department|headcount|total_allowance|client_partner_count|shift:<KEY>/<KEY>
+    sort_departments_by: Optional[str] = "total_allowance"
+    sort_departments_order: Optional[str] = "default"
+
+    # Partners level: client_partner|headcount|total_allowance|shift:<KEY>/<KEY>
+    sort_partners_by: Optional[str] = None
+    sort_partners_order: Optional[str] = None
+
+    # Employees level: emp_name|total_allowance|shift:<KEY>/<KEY>
+    # (If 'headcount' is provided for employees, it falls back to 'total_allowance')
+    sort_employees_by: Optional[str] = None
+    sort_employees_order: Optional[str] = None
 
     class Config:
         extra = "forbid"
-
 
 class ClientTotalAllowanceFilter(BaseModel):
     clients: Union[str, List[str]] = "ALL"
@@ -333,7 +352,7 @@ class DepartmentAnalyticsRequest(BaseModel):
     years: Optional[List[int]] = None
     months: Optional[List[int]] = None
 
-    headcounts: Union[Literal["ALL"], str, List[str]] = "ALL"   
+    headcounts: Union[Literal["ALL"], str, List[str]] = "ALL"
     shifts: Union[Literal["ALL"], str, List[str]] = "ALL"
     top: Union[Literal["ALL"], str, int] = "ALL"
 
@@ -342,9 +361,30 @@ class DepartmentAnalyticsRequest(BaseModel):
     sort_by: Optional[str] = "total_allowance"
     sort_order: str = "default"  # default | asc | desc
 
+    # NEW: Client-level sorting (drilldown view)
+    # Allowed: client | client_partner_count | headcount | total_allowance | shift:<KEY> | <KEY>
+    sort_clients_by: Optional[str] = "total_allowance"
+    sort_clients_order: str = "default"  # default | asc | desc
+
     # NEW: Allowance range filter (inclusive ranges)
     # e.g., "1-10000" or ["80000-1100000"]
     allowance: Optional[Union[str, List[str]]] = None
+
+    class Config:
+        extra = "forbid"
+
+class DepartmentTotalAllowanceFilter(BaseModel):
+    clients: Union[str, List[str]] = "ALL"
+    departments: Union[str, List[str]] = "ALL"
+    years: List[int] = [0]
+    months: List[int] = [0]
+    headcounts: Union[str, List[str]] = "ALL"
+    shifts: Union[str, List[str]] = "ALL"
+    top: str = "ALL"
+
+    # Sorting options for department view
+    sort_by: Literal["total_allowance", "department", "clients", "headcount"] = "total_allowance"
+    sort_order: Literal["asc", "desc", "default"] = "default"
 
     class Config:
         extra = "forbid"

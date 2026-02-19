@@ -272,91 +272,8 @@ def resolve_target_months(
 
     return []
 
-
-def _build_shift_details_object(db: Session, months_to_use: List[date]) -> Dict[str, Dict[str, Any]]:
-    """
-    Returns:
-      {
-        "<SHIFT_KEY>": {
-          "label": "<Label from config first line or key>",
-          "timing": "<Timing from config second line (without parentheses) or ''>",
-          "amount": <float rate, chosen from latest year in selected months; otherwise latest available rate>
-        },
-        ...
-      }
-    """
-    keys = get_shift_keys()
-    out: Dict[str, Dict[str, Any]] = {}
-
-    # Determine years in scope
-    years_in_scope = sorted({d.year for d in months_to_use}) if months_to_use else []
-
-    # Fetch amounts for the relevant years (or all, if none provided)
-    q = db.query(ShiftsAmount)
-    if years_in_scope:
-        q = q.filter(cast(ShiftsAmount.payroll_year, Integer).in_(years_in_scope))
-    amount_rows = q.all()
-
-    # Build mapping: shift_key -> {year -> amount}
-    amounts_by_shift: Dict[str, Dict[int, float]] = {}
-    for r in amount_rows:
-        skey = clean_str(r.shift_type).upper()
-        try:
-            y = int(r.payroll_year) if r.payroll_year is not None else None
-        except Exception:
-            y = None
-        amt = float(r.amount or 0.0)
-        if skey and y:
-            amounts_by_shift.setdefault(skey, {})[y] = amt
-
-    # If some shift had no amount in selected years, fallback to latest across all years
-    if years_in_scope:
-        missing_keys = [k for k in keys if k not in amounts_by_shift or not amounts_by_shift[k]]
-        if missing_keys:
-            all_rows = db.query(ShiftsAmount).filter(
-                func.upper(func.trim(ShiftsAmount.shift_type)).in_(missing_keys)
-            ).all()
-            for r in all_rows:
-                skey = clean_str(r.shift_type).upper()
-                try:
-                    y = int(r.payroll_year) if r.payroll_year is not None else None
-                except Exception:
-                    y = None
-                amt = float(r.amount or 0.0)
-                if skey and y:
-                    amounts_by_shift.setdefault(skey, {}).setdefault(y, amt)
-
-    for k in keys:
-        # parse label/timing from config
-        s = (get_shift_string(k) or "").strip()
-        label, timing = k, ""
-        if s:
-            lines = s.splitlines()
-            if len(lines) >= 1:
-                label = lines[0].strip() or k
-            if len(lines) >= 2:
-                timing = lines[1].strip()
-                if timing.startswith("(") and timing.endswith(")"):
-                    timing = timing[1:-1].strip()
-
-        # pick amount: choose latest year in-scope; else latest overall; else 0.0
-        amount_map = amounts_by_shift.get(k, {})
-        chosen_amt: float = 0.0
-        if years_in_scope:
-            for y in sorted(years_in_scope, reverse=True):
-                if y in amount_map:
-                    chosen_amt = float(amount_map[y])
-                    break
-        if chosen_amt == 0.0 and amount_map:
-            latest_year = max(amount_map.keys())
-            chosen_amt = float(amount_map[latest_year])
-
-        out[k] = {"label": label, "timing": timing, "amount": chosen_amt}
-
-    return out
-
-
 def client_summary_service(db: Session, payload: dict):
+
     payload = payload or {}
     shift_keys = get_shift_keys()
     shift_key_set = set(shift_keys)
@@ -405,15 +322,14 @@ def client_summary_service(db: Session, payload: dict):
     )
 
     if not months_to_use:
-        # Add shift_details even if empty months
         return {
             "periods": {},
             "meta": {"message": "No data found for the selected filters."},
-            "shift_details": _build_shift_details_object(db, months_to_use),
         }
 
     latest_style_request = not payload.get("years") and not payload.get("months")
     response_cache_key = None
+
     if latest_style_request:
         parts = {
             "clients": payload.get("clients", "ALL"),
@@ -425,46 +341,70 @@ def client_summary_service(db: Session, payload: dict):
             "sort_by": payload.get("sort_by", "client_total"),
             "sort_order": payload.get("sort_order", "desc"),
         }
+
         response_cache_key = f"client_summary_latest:{CLIENT_SUMMARY_VERSION}:{str(parts)}:response"
+
         cached_resp = cache.get(response_cache_key)
         if cached_resp:
            
-            if "shift_details" not in cached_resp:
-                fixed = dict(cached_resp)
-                fixed["shift_details"] = _build_shift_details_object(db, months_to_use)
-                cache.set(response_cache_key, fixed, expire=CACHE_TTL)
-                return fixed
+            if isinstance(cached_resp, dict) and "shift_details" in cached_resp:
+                cleaned = dict(cached_resp)
+                cleaned.pop("shift_details", None)
+                cache.set(response_cache_key, cleaned, expire=CACHE_TTL)
+                return cleaned
             return cached_resp
 
     query = build_base_query(db)
 
     filter_clauses = []
+
     if clients_list:
-        filter_clauses.append(func.lower(ShiftAllowances.client).in_([c.lower() for c in clients_list]))
+        filter_clauses.append(
+            func.lower(ShiftAllowances.client).in_([c.lower() for c in clients_list])
+        )
+
     if departments_list:
-        filter_clauses.append(func.lower(ShiftAllowances.department).in_([d.lower() for d in departments_list]))
+        filter_clauses.append(
+            func.lower(ShiftAllowances.department).in_([d.lower() for d in departments_list])
+        )
+
     if emp_id:
         ids = emp_id if isinstance(emp_id, list) else [emp_id]
-        filter_clauses.append(func.lower(ShiftAllowances.emp_id).in_([clean_str(e).lower() for e in ids]))
+        filter_clauses.append(
+            func.lower(ShiftAllowances.emp_id).in_([clean_str(e).lower() for e in ids])
+        )
+
     if client_partner:
         cp_col = ShiftAllowances.client_partner
-        parts = [clean_str(client_partner)] if isinstance(client_partner, str) else [clean_str(p) for p in client_partner]
+        parts = (
+            [clean_str(client_partner)]
+            if isinstance(client_partner, str)
+            else [clean_str(p) for p in client_partner]
+        )
         like_parts = [p for p in parts if p]
         if like_parts:
-            filter_clauses.append(or_(*[func.lower(cp_col).like(f"%{p.lower()}%") for p in like_parts]))
+            filter_clauses.append(
+                or_(*[func.lower(cp_col).like(f"%{p.lower()}%") for p in like_parts])
+            )
+
     if allowed_shifts_for_filter:
-        filter_clauses.append(func.upper(ShiftMapping.shift_type).in_(list(allowed_shifts_for_filter)))
+        filter_clauses.append(
+            func.upper(ShiftMapping.shift_type).in_(list(allowed_shifts_for_filter))
+        )
+
     if filter_clauses:
         query = query.filter(and_(*filter_clauses))
 
     month_numbers = [(d.year, d.month) for d in months_to_use]
+
     month_filters = [
         and_(
             extract("year", ShiftAllowances.duration_month) == y,
-            extract("month", ShiftAllowances.duration_month) == m
+            extract("month", ShiftAllowances.duration_month) == m,
         )
         for y, m in month_numbers
     ]
+
     query = query.filter(or_(*month_filters))
 
     rows = query.all()
@@ -476,13 +416,13 @@ def client_summary_service(db: Session, payload: dict):
 
         if month_str not in aggregated:
             month_total_template = empty_shift_totals(shift_keys)
-            month_total_template.update({
-                "total_head_count": 0,
-                "total_allowance": 0.0
-            })
+            month_total_template.update(
+                {"total_head_count": 0, "total_allowance": 0.0}
+            )
+
             aggregated[month_str] = {
                 "clients": {},
-                "month_total": month_total_template
+                "month_total": month_total_template,
             }
 
         month_data = aggregated[month_str]
@@ -522,6 +462,7 @@ def client_summary_service(db: Session, payload: dict):
             days_val = float(row.days or 0.0)
         except Exception:
             days_val = 0.0
+
         try:
             rate_val = float(row.amount or 0.0)
         except Exception:
@@ -531,6 +472,7 @@ def client_summary_service(db: Session, payload: dict):
 
         emp_map = dept_data["_emp_map"]
         eid = clean_str(row.emp_id)
+
         if eid not in emp_map:
             emp_entry = {
                 "emp_id": eid,
@@ -558,16 +500,20 @@ def client_summary_service(db: Session, payload: dict):
 
         for client_name, client_data in month_data["clients"].items():
             finalized_departments: Dict[str, Any] = {}
+
             for dept_name, dept_data in client_data["departments"].items():
                 emp_map = dept_data.pop("_emp_map", {})
                 employees = list(emp_map.values())
+
                 dept_data["employees"] = employees
                 dept_data["dept_head_count"] = len(employees)
+
                 finalized_departments[dept_name] = dept_data
 
             client_data["departments"] = finalized_departments
 
         filtered_clients: Dict[str, Any] = {}
+
         for client_name, client_data in month_data["clients"].items():
             depts = client_data["departments"]
 
@@ -580,6 +526,7 @@ def client_summary_service(db: Session, payload: dict):
                     eid = e.get("emp_id")
                     if eid:
                         unique_emp_ids.add(eid)
+
             client_headcount = len(unique_emp_ids)
 
             if not range_matches(client_headcount, headcount_ranges):
@@ -587,6 +534,7 @@ def client_summary_service(db: Session, payload: dict):
 
             client_data["client_total"] = client_total
             client_data["client_head_count"] = client_headcount
+
             for k in shift_keys:
                 client_data[k] = per_shift_totals[k]
 
@@ -594,7 +542,6 @@ def client_summary_service(db: Session, payload: dict):
 
         month_data["clients"] = filtered_clients
 
-        
         sort_by = payload.get("sort_by", "client_total")
         sort_order = str(payload.get("sort_order", "desc")).lower()
         reverse = sort_order != "asc"
@@ -613,24 +560,28 @@ def client_summary_service(db: Session, payload: dict):
         if actual_sort_field == "client_name":
             clients_items.sort(
                 key=lambda x: (x[1].get("client_name") or "").lower(),
-                reverse=reverse
+                reverse=reverse,
             )
         else:
             clients_items.sort(
                 key=lambda x: x[1].get(actual_sort_field, 0),
-                reverse=reverse
+                reverse=reverse,
             )
 
         month_data["clients"] = dict(clients_items)
 
         month_total = month_data["month_total"]
+
         for k in shift_keys:
             month_total[k] = sum(c[k] for c in month_data["clients"].values())
-        month_total["total_head_count"] = sum(c["client_head_count"] for c in month_data["clients"].values())
-        month_total["total_allowance"] = sum(c["client_total"] for c in month_data["clients"].values())
 
-   
-    aggregated["shift_details"] = _build_shift_details_object(db, months_to_use)
+        month_total["total_head_count"] = sum(
+            c["client_head_count"] for c in month_data["clients"].values()
+        )
+
+        month_total["total_allowance"] = sum(
+            c["client_total"] for c in month_data["clients"].values()
+        )
 
     if latest_style_request and response_cache_key:
         cache.set(response_cache_key, aggregated, expire=CACHE_TTL)

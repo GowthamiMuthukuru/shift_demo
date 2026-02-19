@@ -1850,11 +1850,91 @@ def _build_shift_details_object_with_currency(db: Session, pairs: List[Tuple[int
     return out
 
 
+def _alpha(v: Any) -> str:
+    """String-normalized lowercase for stable alpha sorting."""
+    return (str(v or "")).lower()
+
+def _num(v: Any) -> float:
+    """Safe numeric conversion with fallback."""
+    try:
+        return float(v if v is not None else 0)
+    except Exception:
+        return 0.0
+
+def _parse_shift_key(sb: str) -> Optional[str]:
+    """Extract shift key from 'shift:<KEY>' pattern; returns UPPER KEY or None."""
+    if not sb:
+        return None
+    s = str(sb).strip()
+    if s.lower().startswith("shift:"):
+        return s.split(":", 1)[1].strip().upper()
+    return None
+
+def _effective_order(for_field_kind: str, requested: str) -> str:
+    """
+    Resolve 'default' order based on field kind:
+      - numeric -> desc
+      - alpha   -> asc
+    """
+    so = (requested or "default").strip().lower()
+    if so in ("asc", "desc"):
+        return so
+    return "desc" if for_field_kind == "num" else "asc"
+
+
+def _alpha(v: Any) -> str:
+    """String-normalized lowercase for stable alpha sorting."""
+    return (str(v or "")).lower()
+
+def _num(v: Any) -> float:
+    """Safe numeric conversion with fallback."""
+    try:
+        return float(v if v is not None else 0)
+    except Exception:
+        return 0.0
+
+def _parse_shift_key(sb: str, shift_keys: Set[str]) -> Optional[str]:
+    """
+    Extract a shift key from either 'shift:<KEY>' or bare '<KEY>'.
+    Returns UPPER shift key if recognized and present in shift_keys; otherwise None.
+    """
+    if not sb:
+        return None
+    s = str(sb).strip()
+    # 'shift:US_INDIA' style
+    if s.lower().startswith("shift:"):
+        key = s.split(":", 1)[1].strip().upper()
+        return key if key in shift_keys else None
+    # bare 'US_INDIA' style
+    u = s.upper()
+    return u if u in shift_keys else None
+
+def _effective_order(for_field_kind: str, requested: str) -> str:
+    """
+    Resolve 'default' order based on field kind:
+      - numeric -> desc
+      - alpha   -> asc
+    """
+    so = (requested or "default").strip().lower()
+    if so in ("asc", "desc"):
+        return so
+    return "desc" if for_field_kind == "num" else "asc"
+
+
 def client_analytics_service(db: Session, payload: dict) -> Dict[str, Any]:
     """
     Client-anchored analytics with deep nesting and shift meta.
 
-
+    Features:
+    - Filters: clients, departments, shifts, years/months.
+    - Aggregation: client → department → partner → employees (+ shift summaries).
+    - Sorting (alpha/numeric-aware) at all levels with tie-breakers:
+        * Clients: client | departments | headcount | total_allowance | shift:<KEY>/<KEY>
+        * Departments: department | headcount | client_partner_count | total_allowance | shift:<KEY>/<KEY>
+        * Partners: client_partner | headcount | total_allowance | shift:<KEY>/<KEY>
+        * Employees: emp_name | total_allowance | shift:<KEY>/<KEY>
+          (If 'headcount' is requested for employees, it falls back to total_allowance)
+    - Default **department-level** sorting is `total_allowance` (numeric desc).
     """
     payload = _payload_to_plain_dict(payload)
 
@@ -1864,8 +1944,25 @@ def client_analytics_service(db: Session, payload: dict) -> Dict[str, Any]:
     shifts_filter     = parse_shifts(payload.get("shifts", "ALL"))              # Set[str] or None
     top_n             = parse_top(payload.get("top", "ALL"))                    # keep your existing 'top' behavior
     employee_cap      = parse_employee_limit(payload.get("headcounts", "ALL"))  # optional employee list cap
+
+    # Backward-compatible (client-level) sort spec (still supported):
     sort_by           = parse_sort_by(payload.get("sort_by", ""))               # client | headcount | total_allowance | departments
     sort_order        = parse_sort_order(payload.get("sort_order", "default"))  # default|asc|desc
+
+    # New granular sort specs (optional): (set department default to total_allowance)
+    clients_sort_by_raw   = payload.get("sort_clients_by",  payload.get("sort_by", "total_allowance"))
+    clients_sort_order    = payload.get("sort_clients_order", payload.get("sort_order", "default"))
+
+    # IMPORTANT: default departments sort to total_allowance (desc by default)
+    depts_sort_by_raw     = payload.get("sort_departments_by", "total_allowance")
+    depts_sort_order      = payload.get("sort_departments_order", "default")
+
+    partners_sort_by_raw  = payload.get("sort_partners_by", "client_partner")
+    partners_sort_order   = payload.get("sort_partners_order", "default")
+
+    # Employees sort (supports emp_name | total_allowance | shift:<KEY> | <KEY> | headcount[fallback])
+    employees_sort_by_raw = payload.get("sort_employees_by", "total_allowance")
+    employees_sort_order  = payload.get("sort_employees_order", "default")
 
     # ---- Resolve periods
     pairs, period_message = validate_years_months(payload, db=db)
@@ -1885,7 +1982,7 @@ def client_analytics_service(db: Session, payload: dict) -> Dict[str, Any]:
             "shift_details": _build_shift_details_object_with_currency(db, []),
         }
 
-    # ---- Base filters
+  
     base_filters_extra: List[Any] = []
     if clients_filter:
         base_filters_extra.append(
@@ -1904,7 +2001,7 @@ def client_analytics_service(db: Session, payload: dict) -> Dict[str, Any]:
         for y, m in pairs
     ]
 
-    # ---- Query rows (days x rate applied below)
+   
     ShiftsAmountAlias = aliased(ShiftsAmount)
     rows_q = (
         db.query(
@@ -1950,11 +2047,8 @@ def client_analytics_service(db: Session, payload: dict) -> Dict[str, Any]:
     SHIFT_KEYS = [str(k).strip().upper() for k in get_all_shift_keys()]
     SHIFT_KEY_SET = set(SHIFT_KEYS)
 
-    # ------------------------------------------------------------------
-    # Aggregate: client → department → partner → employees
-    # Also track per-shift totals at each node.
-    # ------------------------------------------------------------------
-    clients_map: Dict[str, Dict[str, Any]] = {}   # client -> node
+
+    clients_map: Dict[str, Dict[str, Any]] = {}   
     global_emp_set: Set[str] = set()
     global_dept_set: Set[str] = set()
     global_total = 0.0
@@ -2040,9 +2134,6 @@ def client_analytics_service(db: Session, payload: dict) -> Dict[str, Any]:
         global_dept_set.add(f"{client_name}|{dept_name}")  # unique client-dept pairs
         global_total += allowance
 
-    # ------------------------------------------------------------------
-    # Build client items for sorting/top (keep your sorting behavior)
-    # ------------------------------------------------------------------
     items: List[Dict[str, Any]] = []
     for cname, cnode in clients_map.items():
         items.append({
@@ -2050,85 +2141,197 @@ def client_analytics_service(db: Session, payload: dict) -> Dict[str, Any]:
             "departments": len(cnode["_dept_set"]),
             "headcount": len(cnode["_emp_set"]),
             "total_allowance": round(float(cnode["total_allowance"]), 2),
+            "_shifts_summary": cnode.get("shifts_summary", {}),
         })
 
-    # ---- Sorting (using your sort_by / sort_order semantics)
-    # Map values:
-    #   sort_by: client | departments | headcount | total_allowance (others fallback to total_allowance)
-    #   sort_order: asc | desc | default (default => numeric desc, alpha asc)
-    field_kind = {
+    client_field_kind = {
         "client": "alpha",
         "departments": "num",
         "headcount": "num",
         "total_allowance": "num",
     }
-    sb = (sort_by or "").strip().lower()
-    if sb not in field_kind:
-        sb = "total_allowance"
-
-    so = (sort_order or "default").strip().lower()
-    if so not in ("asc", "desc"):
-        effective_order = "desc" if field_kind[sb] == "num" else "asc"
+    client_shift_key = _parse_shift_key(str(clients_sort_by_raw), SHIFT_KEY_SET)
+    if client_shift_key:
+        sort_field = f"shift:{client_shift_key}"
+        client_kind = "num"
     else:
-        effective_order = so
-    reverse = (effective_order == "desc")
+        sb = (str(clients_sort_by_raw) or "").strip().lower()
+        sort_field = sb if sb in client_field_kind else "total_allowance"
+        client_kind = client_field_kind.get(sort_field, "num")
 
-    def _alpha(v: Any) -> str:
-        return (str(v or "")).lower()
+    client_effective_order = _effective_order(client_kind, str(clients_sort_order))
+    client_reverse = (client_effective_order == "desc")
 
-    def _num(v: Any) -> float:
-        try:
-            return float(v if v is not None else 0)
-        except Exception:
-            return 0.0
-
-    def sort_key(it: Dict[str, Any]):
-        v = it.get(sb)
-        if field_kind[sb] == "num":
+    def _client_sort_key(it: Dict[str, Any]):
+        if client_shift_key:
+            v = it["_shifts_summary"].get(client_shift_key, 0.0)
             return (_num(v), _alpha(it.get("client")))
+        if client_kind == "num":
+            return (_num(it.get(sort_field)), _alpha(it.get("client")))
         else:
-            return (_alpha(v), _num(it.get("total_allowance")))
+            return (_alpha(it.get(sort_field)), _num(it.get("total_allowance")))
 
-    items.sort(key=sort_key, reverse=reverse)
+    items.sort(key=_client_sort_key, reverse=client_reverse)
 
-    # ---- Top N (clients)
+    
     if isinstance(top_n, int) and top_n > 0:
         items = items[:top_n]
 
-    # ------------------------------------------------------------------
-    # Build final "clients" object
-    # ------------------------------------------------------------------
+    
     clients_out: Dict[str, Any] = OrderedDict()
     for it in items:
         cname = it["client"]
         cnode = clients_map[cname]
 
-        # departments_breakdown
+       
         departments_out: Dict[str, Any] = OrderedDict()
-        for dname in sorted(cnode["departments_breakdown"].keys(), key=lambda s: s.lower()):
-            dnode = cnode["departments_breakdown"][dname]
+        dept_items: List[Tuple[str, Dict[str, Any], Dict[str, Any]]] = []
+        for dname, dnode in cnode["departments_breakdown"].items():
+            dept_items.append((
+                dname,
+                dnode,
+                {
+                    "department": dname,
+                    "client_partner_count": len(dnode["_partner_set"]),
+                    "headcount": len(dnode["_emp_set"]),
+                    "total_allowance": round(float(dnode["total_allowance"]), 2),
+                    "_shifts_summary": dnode.get("shifts_summary", {}),
+                }
+            ))
 
-            # client partners
+        # Field kinds decide default:
+        #   - NUM -> desc (by _effective_order 'default')
+        #   - ALPHA -> asc
+        dept_field_kind = {
+            "department": "alpha",
+            "client_partner_count": "num",
+            "headcount": "num",
+            "total_allowance": "num",
+        }
+        # Accept both 'shift:<KEY>' and bare '<KEY>'
+        dept_shift_key = _parse_shift_key(str(depts_sort_by_raw), SHIFT_KEY_SET)
+        if dept_shift_key:
+            d_sort_field = f"shift:{dept_shift_key}"
+            d_kind = "num"
+        else:
+            dsb = (str(depts_sort_by_raw) or "").strip().lower()
+            # DEFAULT: total_allowance for department level
+            d_sort_field = dsb if dsb in dept_field_kind else "total_allowance"
+            d_kind = dept_field_kind.get(d_sort_field, "num")
+
+        d_effective_order = _effective_order(d_kind, str(depts_sort_order))
+        d_reverse = (d_effective_order == "desc")
+
+        def _dept_sort_key(tup):
+            _dname, _dnode, metrics = tup
+            if dept_shift_key:
+                v = metrics["_shifts_summary"].get(dept_shift_key, 0.0)
+                return (_num(v), _alpha(metrics.get("department")))
+            if d_kind == "num":
+                return (_num(metrics.get(d_sort_field)), _alpha(metrics.get("department")))
+            else:
+                return (_alpha(metrics.get(d_sort_field)), _num(metrics.get("total_allowance")))
+
+        dept_items.sort(key=_dept_sort_key, reverse=d_reverse)
+
+        # Now render departments (sorted)
+        for dname, dnode, metrics in dept_items:
+          
             partners_out: Dict[str, Any] = OrderedDict()
-            for pname in sorted(dnode["client_partners"].keys(), key=lambda s: s.lower()):
-                pnode = dnode["client_partners"][pname]
+            partner_items: List[Tuple[str, Dict[str, Any], Dict[str, Any]]] = []
+            for pname, pnode in dnode["client_partners"].items():
+                partner_items.append((
+                    pname,
+                    pnode,
+                    {
+                        "client_partner": pname,
+                        "headcount": len(pnode["_emp_set"]),
+                        "total_allowance": round(float(pnode["total_allowance"]), 2),
+                        "_shifts_summary": pnode.get("shifts_summary", {}),
+                    }
+                ))
 
+            partner_field_kind = {
+                "client_partner": "alpha",
+                "headcount": "num",
+                "total_allowance": "num",
+            }
+            partner_shift_key = _parse_shift_key(str(partners_sort_by_raw), SHIFT_KEY_SET)
+            if partner_shift_key:
+                p_sort_field = f"shift:{partner_shift_key}"
+                p_kind = "num"
+            else:
+                psb = (str(partners_sort_by_raw) or "").strip().lower()
+                p_sort_field = psb if psb in partner_field_kind else "client_partner"
+                p_kind = partner_field_kind.get(p_sort_field, "alpha")
+
+            p_effective_order = _effective_order(p_kind, str(partners_sort_order))
+            p_reverse = (p_effective_order == "desc")
+
+            def _partner_sort_key(tup):
+                _pname, _pnode, pmetrics = tup
+                if partner_shift_key:
+                    v = pmetrics["_shifts_summary"].get(partner_shift_key, 0.0)
+                    return (_num(v), _alpha(pmetrics.get("client_partner")))
+                if p_kind == "num":
+                    return (_num(pmetrics.get(p_sort_field)), _alpha(pmetrics.get("client_partner")))
+                else:
+                    return (_alpha(pmetrics.get(p_sort_field)), _num(pmetrics.get("total_allowance")))
+
+            partner_items.sort(key=_partner_sort_key, reverse=p_reverse)
+
+            # Render partners (sorted)
+            for pname, pnode, pmetrics in partner_items:
+                
                 employees_list = list(pnode["_employees"].values())
-                employees_list.sort(key=lambda x: x["total_allowance"], reverse=True)
+
+                emp_field_kind = {
+                    "emp_name": "alpha",
+                    "total_allowance": "num",
+                }
+                # Employees don't have headcount; if requested, fall back to total_allowance
+                esb_raw = str(employees_sort_by_raw or "").strip().lower()
+                if esb_raw == "headcount":
+                    esb = "total_allowance"
+                else:
+                    esb = esb_raw
+
+                emp_shift_key = _parse_shift_key(str(esb), SHIFT_KEY_SET)
+                if emp_shift_key:
+                    e_sort_field = f"shift:{emp_shift_key}"
+                    e_kind = "num"
+                else:
+                    e_sort_field = esb if esb in emp_field_kind else "total_allowance"
+                    e_kind = emp_field_kind.get(e_sort_field, "num")
+
+                e_effective_order = _effective_order(e_kind, str(employees_sort_order))
+                e_reverse = (e_effective_order == "desc")
+
+                def _employee_sort_key(erow: Dict[str, Any]):
+                    if emp_shift_key:
+                        v = erow.get(emp_shift_key, 0.0)  # per-shift value present on erow
+                        return (_num(v), _alpha(erow.get("emp_name")))
+                    if e_kind == "num":
+                        return (_num(erow.get(e_sort_field)), _alpha(erow.get("emp_name")))
+                    else:
+                        return (_alpha(erow.get(e_sort_field)), _num(erow.get("total_allowance")))
+
+                employees_list.sort(key=_employee_sort_key, reverse=e_reverse)
+
                 if isinstance(employee_cap, int) and employee_cap > 0:
                     employees_list = employees_list[:employee_cap]
 
                 partners_out[pname] = {
-                    "headcount": len(pnode["_emp_set"]),
-                    "total_allowance": round(float(pnode["total_allowance"]), 2),
+                    "headcount": pmetrics["headcount"],
+                    "total_allowance": pmetrics["total_allowance"],
                     "shifts_summary": {k: round(float(v), 2) for k, v in pnode["shifts_summary"].items()},
                     "employees": employees_list,
                 }
 
             departments_out[dname] = {
-                "client_partner_count": len(dnode["_partner_set"]),
-                "headcount": len(dnode["_emp_set"]),
-                "total_allowance": round(float(dnode["total_allowance"]), 2),
+                "client_partner_count": metrics["client_partner_count"],
+                "headcount": metrics["headcount"],
+                "total_allowance": metrics["total_allowance"],
                 "shifts_summary": {k: round(float(v), 2) for k, v in dnode["shifts_summary"].items()},
                 "client_partners": partners_out,
             }
@@ -2141,9 +2344,7 @@ def client_analytics_service(db: Session, payload: dict) -> Dict[str, Any]:
             "departments_breakdown": departments_out,
         }
 
-    # ------------------------------------------------------------------
-    # Summary & response
-    # ------------------------------------------------------------------
+    
     result = {
         "periods": periods,
         "message": period_message or "",
@@ -2158,6 +2359,7 @@ def client_analytics_service(db: Session, payload: dict) -> Dict[str, Any]:
     }
 
     return result
+
 try:
     # SHIFT_TYPES may be a dict mapping OR a set/list of codes in your project
     from utils.shift_config import SHIFT_TYPES, get_all_shift_keys
@@ -2239,9 +2441,7 @@ def _payload_to_plain_dict(payload: Any) -> dict:
     except Exception:
         return {}
 
-# ======================================================================
-# PARSERS (filters, sorting, ranges)
-# ======================================================================
+
 
 def _coerce_int_list(values: Any, field_name: str, four_digit_year: bool = False) -> List[int]:
     if values is None:
@@ -2574,9 +2774,44 @@ def _build_shift_details_from_config(shift_types_obj: Any) -> Dict[str, Dict[str
 
     return out
 
+def _alpha(v: Any) -> str:
+    """String-normalized lowercase for stable alpha sorting."""
+    return (str(v or "")).lower()
+
+def _num(v: Any) -> float:
+    """Safe numeric conversion with fallback."""
+    try:
+        return float(v if v is not None else 0)
+    except Exception:
+        return 0.0
+
+def _parse_shift_key(sb: str, shift_keys: Set[str]) -> Optional[str]:
+    """
+    Extract a shift key from either 'shift:<KEY>' or bare '<KEY>'.
+    Returns UPPER shift key if recognized; otherwise None.
+    """
+    if not sb:
+        return None
+    s = str(sb).strip()
+    if s.lower().startswith("shift:"):
+        key = s.split(":", 1)[1].strip().upper()
+        return key if key in shift_keys else None
+    u = s.upper()
+    return u if u in shift_keys else None
+
+def _effective_order(for_field_kind: str, requested: str) -> str:
+    """
+    Resolve 'default' order based on field kind:
+      - numeric -> desc
+      - alpha   -> asc
+    """
+    so = (requested or "default").strip().lower()
+    if so in ("asc", "desc"):
+        return so
+    return "desc" if for_field_kind == "num" else "asc"
 
 
-def department_analytics_service(db: Session, payload: DepartmentAnalyticsRequest) -> Dict[str, Any]:
+def department_analytics_service(db: Session, payload: 'DepartmentAnalyticsRequest') -> Dict[str, Any]:
     """
     Department analytics:
       - Aggregate by department
@@ -2586,6 +2821,11 @@ def department_analytics_service(db: Session, payload: DepartmentAnalyticsReques
       - No "starts with" filters
       - OPTION A: Employees only under partners (omit client-level employees when partners exist)
       - Adds top-level 'shift_details' parsed from SHIFT_TYPES (imported, not hardcoded)
+
+    ENHANCEMENT:
+      - Client-level sorting in drilldown via sort_clients_by/sort_clients_order.
+        Allowed: client | client_partner_count | headcount | total_allowance | shift:<KEY> | <KEY>
+        Defaults to total_allowance (numeric desc).
     """
     payload_dict = _payload_to_plain_dict(payload)
 
@@ -2594,8 +2834,15 @@ def department_analytics_service(db: Session, payload: DepartmentAnalyticsReques
     shifts_filter = parse_shifts(payload_dict.get("shifts", "ALL"))
     top_n = parse_top(payload_dict.get("top", "ALL"))
     employee_cap = parse_employee_limit(payload_dict.get("headcounts", "ALL"))
+
+    # Department-level sorting (existing)
     sort_by = parse_sort_by_department(payload_dict.get("sort_by", ""))
     sort_order = parse_sort_order(payload_dict.get("sort_order", "default"))
+
+    # NEW: Drilldown client sorting
+    sort_clients_by = payload_dict.get("sort_clients_by", "total_allowance")
+    sort_clients_order = payload_dict.get("sort_clients_order", "default")
+
     allowance_ranges = parse_allowance_ranges(payload_dict.get("allowance"))
 
     # Periods
@@ -2604,6 +2851,17 @@ def department_analytics_service(db: Session, payload: DepartmentAnalyticsReques
 
     # Shift details (from config)
     shift_details = _build_shift_details_from_config(SHIFT_TYPES)
+
+    # Prepare shift keys / validation set
+    try:
+        # Prefer config-driven keys (if you have get_all_shift_keys, you can use that instead)
+        SHIFT_KEYS = [str(k).strip().upper() for k in get_all_shift_keys()]  # type: ignore[name-defined]
+    except Exception:
+        # Fallback from SHIFT_TYPES if needed
+        SHIFT_KEYS = [str(k).strip().upper() for k in getattr(globals().get("SHIFT_TYPES", {}), "keys", lambda: {})()]
+        if not SHIFT_KEYS and isinstance(SHIFT_TYPES, dict):  # type: ignore[name-defined]
+            SHIFT_KEYS = [str(k).strip().upper() for k in SHIFT_TYPES.keys()]  # type: ignore[name-defined]
+    SHIFT_KEY_SET: Set[str] = set(SHIFT_KEYS)
 
     if not pairs:
         return {
@@ -2698,9 +2956,9 @@ def department_analytics_service(db: Session, payload: DepartmentAnalyticsReques
         cname = clean_str(client) or "UNKNOWN"
         cpname = clean_str(cp) or "UNKNOWN"
         eid = clean_str(emp_id)
-        st = clean_str(stype).upper()
+        st = (clean_str(stype) or "").upper()
 
-        if SHIFT_KEY_SET and st not in SHIFT_KEY_SET:
+        if SHIFT_KEY_SET and st and st not in SHIFT_KEY_SET:
             continue
 
         allowance = float(days or 0) * float(amt or 0)
@@ -2811,7 +3069,7 @@ def department_analytics_service(db: Session, payload: DepartmentAnalyticsReques
             "total_allowance": total_allow,
         }
 
-    # Sorting & Top-N
+    # Sorting & Top-N for departments
     if sort_order != "default" and sort_by:
         departments_out = apply_sort_dict_department(departments_out, sort_by, sort_order)
     departments_out = top_n_dict(departments_out, top_n)
@@ -2836,7 +3094,7 @@ def department_analytics_service(db: Session, payload: DepartmentAnalyticsReques
             "total_allowance": round(total_allowance_sum, 2),
         },
         "departments": departments_out,
-        "shift_details": shift_details,  # from config (imported)
+        "shift_details": shift_details,  
     }
 
     # Drilldown (only if exactly one department selected AND it survived filters)
@@ -2852,10 +3110,59 @@ def department_analytics_service(db: Session, payload: DepartmentAnalyticsReques
                     shifts_summary[k] += emp_data.get(k, 0.0)
             dept_obj["shifts_summary"] = {k: round(v, 2) for k, v in shifts_summary.items()}
 
-            # clients -> client_partners (Option A behavior)
-            clients_out: Dict[str, Any] = {}
+          
+            # Build sortable list from clients_map for this department
+            client_items: List[Tuple[str, Dict[str, Any], Dict[str, Any]]] = []
             for cname, cnode in clients_map.items():
-                # Build partner collections first
+                client_items.append((
+                    cname,
+                    cnode,
+                    {
+                        "client": cname,
+                        "client_partner_count": len(cnode["partners_set"]),
+                        "headcount": len(cnode["emp_set"]),
+                        "total_allowance": round(float(cnode["total_allowance"]), 2),
+                        "_shifts_summary": cnode.get("shift_totals", {}),
+                    }
+                ))
+
+            # Allowed client fields & kinds
+            client_field_kind = {
+                "client": "alpha",
+                "client_partner_count": "num",
+                "headcount": "num",
+                "total_allowance": "num",
+            }
+
+            client_shift_key = _parse_shift_key(str(sort_clients_by), SHIFT_KEY_SET)
+            if client_shift_key:
+                c_sort_field = f"shift:{client_shift_key}"
+                c_kind = "num"
+            else:
+                csb = (str(sort_clients_by) or "").strip().lower()
+                # Fallback to total_allowance (numeric desc default)
+                c_sort_field = csb if csb in client_field_kind else "total_allowance"
+                c_kind = client_field_kind.get(c_sort_field, "num")
+
+            c_effective_order = _effective_order(c_kind, str(sort_clients_order))
+            c_reverse = (c_effective_order == "desc")
+
+            def _client_sort_key(tup):
+                _name, _node, metrics = tup
+                if client_shift_key:
+                    v = metrics["_shifts_summary"].get(client_shift_key, 0.0)
+                    return (_num(v), _alpha(metrics.get("client")))
+                if c_kind == "num":
+                    return (_num(metrics.get(c_sort_field)), _alpha(metrics.get("client")))
+                else:
+                    return (_alpha(metrics.get(c_sort_field)), _num(metrics.get("total_allowance")))
+
+            client_items.sort(key=_client_sort_key, reverse=c_reverse)
+
+            # clients -> client_partners (Option A behavior)
+            clients_out: "OrderedDict[str, Any]" = OrderedDict()
+            for cname, cnode, cmetrics in client_items:
+                # Build partner collections
                 partners_out: Dict[str, Any] = {}
                 for (client_key, partner_name), pnode in partners_map.items():
                     if client_key != cname:
@@ -2876,14 +3183,13 @@ def department_analytics_service(db: Session, payload: DepartmentAnalyticsReques
                         ),
                     }
 
-                # If partners exist, OMIT client-level employees to avoid duplication
                 has_partners = len(partners_out) > 0
 
                 client_obj = {
-                    "client_partner_count": len(cnode["partners_set"]),
-                    "headcount": len(cnode["emp_set"]),
-                    "total_allowance": round(cnode["total_allowance"], 2),
-                    "shifts_summary": {k: round(v, 2) for k, v in cnode["shift_totals"].items()},
+                    "client_partner_count": cmetrics["client_partner_count"],
+                    "headcount": cmetrics["headcount"],
+                    "total_allowance": cmetrics["total_allowance"],
+                    "shifts_summary": {k: round(float(v), 2) for k, v in cnode["shift_totals"].items()},
                     "client_partners": partners_out,
                 }
 
@@ -2904,4 +3210,6 @@ def department_analytics_service(db: Session, payload: DepartmentAnalyticsReques
             result["departments"][selected_key] = dept_obj
 
     return result
+
+
 
