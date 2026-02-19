@@ -12,7 +12,7 @@ from schemas.dashboardschema import (
     PieChartClientShift,
     ClientList,
     DashboardFilterRequest,
-    ClientAnalyticsRequest
+    ClientAnalyticsRequest,DepartmentAnalyticsRequest
 )
 
 from services.dashboard_service import (
@@ -21,7 +21,9 @@ from services.dashboard_service import (
     get_vertical_bar_service,
     get_piechart_shift_summary,
     get_all_clients_service,
-    get_client_dashboard_summary,client_analytics_service
+    get_client_dashboard_summary,
+    client_analytics_service,
+    department_analytics_service
 )
 
 
@@ -102,3 +104,11 @@ def client_analytics(
     _current_user = Depends(get_current_user),
 ):
     return client_analytics_service(db, payload.dict())
+
+@router.post("/department-Page-Graph")
+def department_analytics(
+    payload: DepartmentAnalyticsRequest,
+    db: Session = Depends(get_db),
+    _current_user = Depends(get_current_user),
+):
+    return department_analytics_service(db, payload)
