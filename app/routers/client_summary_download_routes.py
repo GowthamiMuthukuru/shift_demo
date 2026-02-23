@@ -32,6 +32,7 @@ def download_client_summary_excel(
             "headcounts": "1-10",
             "sort_by": "total_allowance",
             "sort_order": "desc",
+            "allowance": "5000-20000",
         },
     ),
     db: Session = Depends(get_db),

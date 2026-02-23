@@ -13,7 +13,7 @@ from models.models import ShiftAllowances, ShiftMapping, ShiftsAmount
 from utils.shift_config import get_all_shift_keys
 from schemas.dashboardschema import ClientTotalAllowanceFilter,DepartmentDashboardResponse,DashboardFilter,DeptDashboardFilter,DepartmentTotalAllowanceFilter
 from collections import OrderedDict
-
+from decimal import Decimal, InvalidOperation
 import re
 from collections import defaultdict
 from sqlalchemy import func, and_, or_, cast, Integer, extract
@@ -412,7 +412,7 @@ def _get_company_enum_key(client_name: str) -> str:
 
     for company in Company:
         if company.value.strip().lower() == client_name.strip().lower():
-            return company.name  # e.g., ILC_DOVER
+            return company.name  
 
     return client_name
 
@@ -421,6 +421,41 @@ def get_client_total_allowances(db: Session, filters):
     current_year = today.year
     current_month = today.month
     messages: List[str] = []
+
+    def _parse_allowance_ranges(allowance) -> Optional[List[Tuple[Decimal, Decimal]]]:
+        """
+        Accepts: None | "ALL" -> None (no filter)
+                 "min-max" string (inclusive)
+                 ["a-b","c-d"] -> OR semantics
+        Returns: list[(Decimal(min), Decimal(max))] or None
+        """
+        if allowance in (None, "ALL"):
+            return None
+        items = allowance if isinstance(allowance, list) else [allowance]
+        ranges: List[Tuple[Decimal, Decimal]] = []
+        for item in items:
+            s = str(item or "").strip()
+            if "-" not in s:
+                raise HTTPException(400, f"Invalid allowance range: {item}. Use 'min-max' like '1000-5000'.")
+            parts = s.split("-")
+            if len(parts) != 2:
+                raise HTTPException(400, f"Invalid allowance range: {item}. Use 'min-max' like '1000-5000'.")
+            try:
+                lo = Decimal(parts[0].strip())
+                hi = Decimal(parts[1].strip())
+            except (InvalidOperation, ValueError):
+                raise HTTPException(400, f"Invalid allowance numbers in range: {item}.")
+            if lo > hi:
+                raise HTTPException(400, f"Invalid allowance range (start > end): {item}.")
+            ranges.append((lo, hi))
+        return ranges or None
+
+    def _allowance_in_ranges(value: Decimal, ranges: Optional[List[Tuple[Decimal, Decimal]]]) -> bool:
+        if not ranges:
+            return True
+        v = Decimal(value if value is not None else 0)
+        return any(lo <= v <= hi for (lo, hi) in ranges)
+   
 
     raw_years = filters.years or []
     raw_months = filters.months or []
@@ -585,12 +620,20 @@ def get_client_total_allowances(db: Session, filters):
         getattr(filters, "headcounts", None)
     )
 
+    # parse allowance filter ranges
+    allowance_ranges = _parse_allowance_ranges(getattr(filters, "allowance", None))
+
     result: List[Dict[str, Any]] = []
 
     for client, total in client_totals.items():
         headcount = len(client_emps.get(client, set()))
 
+        # Headcount filter
         if not _headcount_matches(headcount, headcount_rules):
+            continue
+
+        #  Allowance filter at CLIENT level 
+        if not _allowance_in_ranges(total, allowance_ranges):
             continue
 
         enum_key = _get_company_enum_key(client)
@@ -629,7 +672,7 @@ def get_client_total_allowances(db: Session, filters):
             "departments": depts_out
         })
 
-    # Sorting
+    
     sort_by_key = getattr(filters, "sort_by", "total_allowance")
     sort_order_in = getattr(filters, "sort_order", "desc").lower()
     reverse = sort_order_in == "desc"
@@ -645,7 +688,7 @@ def get_client_total_allowances(db: Session, filters):
             reverse=reverse
         )
 
-    # Top filter
+  
     top_value = getattr(filters, "top", None)
 
     if top_value and str(top_value).lower() != "all":
@@ -664,7 +707,6 @@ def get_client_total_allowances(db: Session, filters):
         "messages": messages,
         "data": result
     }
-
 def get_client_departments_service(db: Session):
 
     rows = (
@@ -926,42 +968,115 @@ def _extract_employee_id(row: ShiftAllowances) -> Optional[str]:
 
     return None
 
+def _parse_allowance_ranges(allowance):
+    """
+    Accepts: None | "ALL" -> None; "min-max"; ["a-b","c-d"] (inclusive ranges; OR semantics)
+    Returns: list[(Decimal(min), Decimal(max))] or None
+    """
+    if allowance in (None, "ALL"):
+        return None
+
+    items = allowance if isinstance(allowance, list) else [allowance]
+    ranges = []
+    for item in items:
+        s = str(item or "").strip()
+        if "-" not in s:
+            raise HTTPException(400, f"Invalid allowance range: {item}. Use 'min-max' like '1000-5000'.")
+        parts = s.split("-")
+        if len(parts) != 2:
+            raise HTTPException(400, f"Invalid allowance range: {item}. Use 'min-max' like '1000-5000'.")
+        try:
+            lo = Decimal(parts[0].strip())
+            hi = Decimal(parts[1].strip())
+        except (InvalidOperation, ValueError):
+            raise HTTPException(400, f"Invalid allowance numbers in range: {item}.")
+        if lo > hi:
+            raise HTTPException(400, f"Invalid allowance range (start > end): {item}.")
+        ranges.append((lo, hi))
+    return ranges or None
+
+
+def _allowance_in_ranges(value: Decimal, ranges) -> bool:
+    """value is Decimal; ranges are List[(Decimal, Decimal)] or None."""
+    if not ranges:
+        return True
+    v = Decimal(value if value is not None else 0)
+    return any(lo <= v <= hi for (lo, hi) in ranges)
+from collections import OrderedDict, defaultdict
+from datetime import date
+from decimal import Decimal, InvalidOperation
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+from fastapi import HTTPException
+from sqlalchemy.orm import Session, aliased
+from sqlalchemy import func, and_, or_, extract, cast, Integer
+
+# Assumes these exist in your module/environment:
+# ShiftAllowances, ShiftsAmount, VALID_SHIFTS
+# _safe_int, _resolve_periods_and_messages, _parse_headcount_filter,
+# _headcount_matches, _extract_employee_id
+
+def _parse_allowance_ranges(allowance):
+    """
+    Accepts: None | "ALL" -> None
+             "min-max" (inclusive)
+             ["a-b","c-d"] -> OR semantics
+    Returns: list[(Decimal(min), Decimal(max))] or None
+    """
+    if allowance in (None, "ALL"):
+        return None
+
+    items = allowance if isinstance(allowance, list) else [allowance]
+    ranges: List[Tuple[Decimal, Decimal]] = []
+    for item in items:
+        s = str(item or "").strip()
+        if "-" not in s:
+            raise HTTPException(400, f"Invalid allowance range: {item}. Use 'min-max' like '1000-5000'.")
+        parts = s.split("-")
+        if len(parts) != 2:
+            raise HTTPException(400, f"Invalid allowance range: {item}. Use 'min-max' like '1000-5000'.")
+        try:
+            lo = Decimal(parts[0].strip())
+            hi = Decimal(parts[1].strip())
+        except (InvalidOperation, ValueError):
+            raise HTTPException(400, f"Invalid allowance numbers in range: {item}.")
+        if lo > hi:
+            raise HTTPException(400, f"Invalid allowance range (start > end): {item}.")
+        ranges.append((lo, hi))
+    return ranges or None
+
+
+def _allowance_in_ranges(value: Decimal, ranges) -> bool:
+    """value is Decimal; ranges are List[(Decimal, Decimal)] or None."""
+    if not ranges:
+        return True
+    v = Decimal(value if value is not None else 0)
+    return any(lo <= v <= hi for (lo, hi) in ranges)
+
 
 def get_client_dashboard(db: Session, filters) -> Dict[str, Any]:
     """
     Builds a client dashboard with departments count, headcount, client partner, and total allowance,
     following the corrected period resolution logic and filters.
     Supports sorting and top N limits.
-
-    Response structure:
-    {
-      "summary": {"selected_periods": [{"year": 2025, "months": [12]}]},
-      "messages": [...],
-      "dashboard": OrderedDict({
-        "<Client>": {
-          "client_partner": <str|None>,
-          "departments": <int>,
-          "headcount": <int>,
-          "total_allowance": <float>
-        }, ...
-      })
-    }
     """
     today = date.today()
 
+    # Year validation
     if filters.years and filters.years != [0]:
         for y in filters.years:
             yi = _safe_int(y)
             if yi is None or yi < 2000 or yi > today.year + 5:
                 raise HTTPException(400, f"Invalid year: {y}")
 
+    # Month validation
     if filters.months and filters.months != [0]:
         for m in filters.months:
             mi = _safe_int(m)
             if mi is None or mi < 1 or mi > 12:
                 raise HTTPException(400, f"Invalid month: {m}")
 
- 
+    # Shifts validation
     if filters.shifts != "ALL":
         shifts_to_check = filters.shifts if isinstance(filters.shifts, list) else [filters.shifts]
         for s in shifts_to_check:
@@ -969,7 +1084,7 @@ def get_client_dashboard(db: Session, filters) -> Dict[str, Any]:
             if VALID_SHIFTS and shift_key not in VALID_SHIFTS:
                 raise HTTPException(400, f"Invalid shift type: {s}")
 
-  
+    # Headcounts validation
     if filters.headcounts not in (None, "ALL", [0]):
         values = filters.headcounts if isinstance(filters.headcounts, list) else [filters.headcounts]
         for item in values:
@@ -985,7 +1100,7 @@ def get_client_dashboard(db: Session, filters) -> Dict[str, Any]:
             elif not s.isdigit():
                 raise HTTPException(400, f"Invalid headcount format: {item}. Use 5 or 1-10.")
 
-   
+    # Top parsing
     if str(getattr(filters, "top", "ALL")).lower() == "all":
         top_int: Optional[int] = None
     else:
@@ -995,13 +1110,17 @@ def get_client_dashboard(db: Session, filters) -> Dict[str, Any]:
         if top_int <= 0:
             raise HTTPException(400, "top must be > 0")
 
-    rate_rows = db.query(ShiftsAmount).all()
-    rates = {str(r.shift_type).upper(): Decimal(r.amount) for r in rate_rows}
+    # allowance ranges (optional, inclusive ranges)
+    allowance_ranges = _parse_allowance_ranges(getattr(filters, "allowance", None))
 
-   
+    # Rates
+    rate_rows = db.query(ShiftsAmount).all()
+    rates = {str(r.shift_type).upper(): Decimal(r.amount or 0) for r in rate_rows}
+
+    # Base query
     q = db.query(ShiftAllowances)
 
-   
+    # Client filter(s)
     if getattr(filters, "client_starts_with", None):
         prefix = filters.client_starts_with.strip().lower()
         q = q.filter(func.lower(func.trim(ShiftAllowances.client)).like(f"{prefix}%"))
@@ -1015,7 +1134,7 @@ def get_client_dashboard(db: Session, filters) -> Dict[str, Any]:
             if norm:
                 q = q.filter(func.lower(func.trim(ShiftAllowances.client)) == norm)
 
-    
+    # Department filter(s)
     if getattr(filters, "departments", "ALL") != "ALL":
         if isinstance(filters.departments, list):
             norm_depts = [str(d).strip().lower() for d in filters.departments if str(d).strip()]
@@ -1026,8 +1145,10 @@ def get_client_dashboard(db: Session, filters) -> Dict[str, Any]:
             if norm_dept:
                 q = q.filter(func.lower(func.trim(ShiftAllowances.department)) == norm_dept)
 
+    # Period resolution (with messages)
     years, months_by_year, messages = _resolve_periods_and_messages(db, q, filters, today)
 
+    # Apply year/month filter
     pair_clauses = []
     for y, ms in months_by_year.items():
         pair_clauses.append(and_(
@@ -1039,8 +1160,10 @@ def get_client_dashboard(db: Session, filters) -> Dict[str, Any]:
 
     rows = q.all()
 
+    # Headcount rules
     hc_rules = _parse_headcount_filter(filters.headcounts)
 
+    # Shifts selection
     selected_shifts: Optional[Set[str]] = None
     if filters.shifts != "ALL":
         if isinstance(filters.shifts, list):
@@ -1048,11 +1171,12 @@ def get_client_dashboard(db: Session, filters) -> Dict[str, Any]:
         else:
             selected_shifts = {str(filters.shifts).upper()}
 
- 
+    # Aggregation containers
     employees_by_client: Dict[str, Set[str]] = {}
     departments_by_client: Dict[str, Set[str]] = {}
     allowances_by_client: Dict[str, Decimal] = {}
 
+    # Aggregate
     for row in rows:
         client = (row.client or "Unknown").strip()
         emp = _extract_employee_id(row)
@@ -1077,10 +1201,15 @@ def get_client_dashboard(db: Session, filters) -> Dict[str, Any]:
             rate = rates.get(shift_key, Decimal(0))
             allowances_by_client[client] += days * rate
 
+    # Build items, applying headcount + allowance filters
     items: List[Dict[str, Any]] = []
     for client, total in allowances_by_client.items():
         hc = len(employees_by_client.get(client, set()))
         if not _headcount_matches(hc, hc_rules):
+            continue
+
+        #  Allowance filter at CLIENT level (inclusive; OR across ranges)
+        if not _allowance_in_ranges(total, allowance_ranges):
             continue
 
         client_partner_set = {
@@ -1098,7 +1227,7 @@ def get_client_dashboard(db: Session, filters) -> Dict[str, Any]:
             "total_allowance": float(total),
         })
 
- 
+    # Sorting (unchanged)
     field_kind = {
         "client": "alpha",
         "client_partner": "alpha",
@@ -1114,7 +1243,6 @@ def get_client_dashboard(db: Session, filters) -> Dict[str, Any]:
     if sort_by not in valid_sort_keys:
         raise HTTPException(400, f"Invalid sort_by value: {sort_by}. Must be one of {sorted(valid_sort_keys)}")
 
-    # default: numeric -> desc, alpha -> asc
     if sort_order not in ("asc", "desc"):
         effective_order = "desc" if field_kind[sort_by] == "num" else "asc"
     else:
@@ -1134,19 +1262,19 @@ def get_client_dashboard(db: Session, filters) -> Dict[str, Any]:
     def sort_key(item: Dict[str, Any]):
         v = item.get(sort_by)
         if field_kind[sort_by] == "num":
-            # numeric primary, client name as tiebreaker
+            
             return (_num(v), _alpha(item.get("client")))
         else:
-            # alpha primary, total_allowance (numeric) as secondary for stability
+            
             return (_alpha(v), _num(item.get("total_allowance")))
 
     items.sort(key=sort_key, reverse=reverse)
 
-   
+    # Top-N
     if top_int:
         items = items[:top_int]
 
-   
+    # Dashboard output
     dashboard = OrderedDict()
     for it in items:
         dashboard[it["client"]] = {
@@ -1159,6 +1287,13 @@ def get_client_dashboard(db: Session, filters) -> Dict[str, Any]:
     if not dashboard and not messages:
         messages.append("No data found for selected filters.")
 
+    # Selected periods summary
+    def _group_selected_periods_from_map(months_map: Dict[int, List[int]]) -> List[Dict[str, Any]]:
+        out = []
+        for y in sorted(months_map.keys()):
+            out.append({"year": y, "months": sorted(set(months_map[y]))})
+        return out
+
     selected_periods = _group_selected_periods_from_map(months_by_year)
 
     return {
@@ -1166,7 +1301,6 @@ def get_client_dashboard(db: Session, filters) -> Dict[str, Any]:
         "messages": messages,
         "dashboard": dashboard
     }
-
 
 try:
     from utils.shift_config import get_all_shift_keys  
@@ -1645,6 +1779,50 @@ def get_department_total_allowances(db: Session, filters: DepartmentTotalAllowan
     current_month = today.month
     messages: List[str] = []
 
+    
+    from decimal import Decimal, InvalidOperation
+
+    def _parse_allowance_ranges(allowance) -> Optional[List[Tuple[Decimal, Decimal]]]:
+        """
+        Accepts: None | "ALL" -> None (no filter)
+                 "min-max" (inclusive)
+                 ["a-b","c-d"] -> OR semantics across ranges
+        Returns: list[(Decimal(min), Decimal(max))] or None
+        """
+        if allowance in (None, "ALL"):
+            return None
+        items = allowance if isinstance(allowance, list) else [allowance]
+        ranges: List[Tuple[Decimal, Decimal]] = []
+        for item in items:
+            s = str(item or "").strip()
+            if "-" not in s:
+                raise HTTPException(400, f"Invalid allowance range: {item}. Use 'min-max' like '1000-5000'.")
+            parts = s.split("-")
+            if len(parts) != 2:
+                raise HTTPException(400, f"Invalid allowance range: {item}. Use 'min-max' like '1000-5000'.")
+            try:
+                lo = Decimal(parts[0].strip())
+                hi = Decimal(parts[1].strip())
+            except (InvalidOperation, ValueError):
+                raise HTTPException(400, f"Invalid allowance numbers in range: {item}.")
+            if lo > hi:
+                raise HTTPException(400, f"Invalid allowance range (start > end): {item}.")
+            ranges.append((lo, hi))
+        return ranges or None
+
+    def _allowance_in_ranges(value: Union[Decimal, float, int], ranges: Optional[List[Tuple[Decimal, Decimal]]]) -> bool:
+        if not ranges:
+            return True
+        try:
+            v = Decimal(str(value))
+        except (InvalidOperation, ValueError):
+            return False
+        return any(lo <= v <= hi for (lo, hi) in ranges)
+
+
+    allowance_ranges = _parse_allowance_ranges(getattr(filters, "allowance", None))
+   
+
     raw_years = filters.years or []
     raw_months = filters.months or []
 
@@ -1756,7 +1934,7 @@ def get_department_total_allowances(db: Session, filters: DepartmentTotalAllowan
         getattr(filters, "shifts", None)
     )
 
-    
+  
     dept_totals: Dict[str, Decimal] = defaultdict(lambda: Decimal(0))
     dept_emps: Dict[str, set] = defaultdict(set)                # unique emp ids per dept
     dept_clients: Dict[str, set] = defaultdict(set)             # unique clients per dept
@@ -1814,12 +1992,16 @@ def get_department_total_allowances(db: Session, filters: DepartmentTotalAllowan
         getattr(filters, "headcounts", None)
     )
 
-    
+   
     result: List[Dict[str, Any]] = []
 
     for dept, total in dept_totals.items():
         headcount = len(dept_emps.get(dept, set()))
         if not _headcount_matches(headcount, headcount_rules):
+            continue
+
+        #  department total allowance filter 
+        if not _allowance_in_ranges(total, allowance_ranges):
             continue
 
         shifts_out = {
@@ -1828,7 +2010,6 @@ def get_department_total_allowances(db: Session, filters: DepartmentTotalAllowan
             if v > 0
         }
 
-        # Optional clients breakdown (handy for drilldown or tooltips)
         clients_out = []
         for cname, crec in dept_clients_breakdown[dept].items():
             c_head = len(crec["emp_ids"])
@@ -1845,7 +2026,7 @@ def get_department_total_allowances(db: Session, filters: DepartmentTotalAllowan
 
         result.append({
             "department": dept,
-            "display_name": dept,  # for UI consistency if you expect this key
+            "display_name": dept,  
             "clients": len(dept_clients.get(dept, set())),
             "headcount": headcount,
             "total_allowance": float(total),
@@ -1853,7 +2034,7 @@ def get_department_total_allowances(db: Session, filters: DepartmentTotalAllowan
             "clients_breakdown": clients_out
         })
 
-   
+  
     sort_by_key = getattr(filters, "sort_by", "total_allowance")
     sort_order_in = getattr(filters, "sort_order", "default").lower()
 
@@ -1872,7 +2053,7 @@ def get_department_total_allowances(db: Session, filters: DepartmentTotalAllowan
             reverse=reverse
         )
 
-  
+   
     top_value = getattr(filters, "top", None)
     if top_value and str(top_value).lower() != "all":
         if not str(top_value).isdigit() or int(top_value) <= 0:

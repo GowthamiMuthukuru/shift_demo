@@ -17,7 +17,7 @@ import re
 from datetime import datetime, date
 from typing import List, Union, Optional, Dict, Any, Tuple, Set
 from collections import Counter
-
+from decimal import Decimal, InvalidOperation
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
 from sqlalchemy import func, and_, or_, extract
@@ -410,8 +410,6 @@ def _build_shift_meta(keys: List[str], rates: Dict[str, float]) -> Dict[str, Dic
         meta[k] = {"label": label, "timing": timing, "amount": amount}
     return meta
 
-
-
 def export_filtered_excel(
     db: Session,
     emp_id: Optional[str] = None,
@@ -426,8 +424,54 @@ def export_filtered_excel(
     headcounts: Union[str, List[str]] = "ALL",
     sort_by: str = "total_allowance",
     sort_order: str = "default",
+    allowance: Union[str, List[str], None] = None,
 ):
-    # Validate & normalize selected shifts
+    """
+    Rewritten with employee-level 'allowance' filter (inclusive ranges).
+    Response schema is unchanged.
+    """
+
+    # -----------------------------
+    # Local helpers for allowance ranges
+    # -----------------------------
+    def _parse_allowance_ranges(_allowance: Union[str, List[str], None]) -> Optional[List[Tuple[Decimal, Decimal]]]:
+        """
+        Accepts: None | "min-max" | ["a-b", "c-d"] ; returns list of (min, max) Decimal tuples (inclusive)
+        """
+        if _allowance is None:
+            return None
+        items = _allowance if isinstance(_allowance, list) else [_allowance]
+        ranges: List[Tuple[Decimal, Decimal]] = []
+        for item in items:
+            s = str(item or "").strip()
+            if not s or "-" not in s:
+                raise HTTPException(400, f"Invalid allowance range: {item}. Use 'min-max' like '1000-5000'.")
+            parts = s.split("-")
+            if len(parts) != 2:
+                raise HTTPException(400, f"Invalid allowance range: {item}. Use 'min-max' like '1000-5000'.")
+            try:
+                a = Decimal(parts[0].strip())
+                b = Decimal(parts[1].strip())
+            except (InvalidOperation, ValueError):
+                raise HTTPException(400, f"Invalid allowance numbers in range: {item}.")
+            if a > b:
+                raise HTTPException(400, f"Invalid allowance range (start > end): {item}.")
+            ranges.append((a, b))
+        return ranges or None
+
+    def _allowance_in_ranges(value: Union[Decimal, float, int], _ranges: Optional[List[Tuple[Decimal, Decimal]]]) -> bool:
+        if _ranges is None:
+            return True
+        try:
+            v = Decimal(str(value))
+        except (InvalidOperation, ValueError):
+            return False
+        for lo, hi in _ranges:
+            if lo <= v <= hi:
+                return True
+        return False
+
+    
     shift_values = _normalize_to_list(shifts)
     if shift_values:
         allowed = {s.upper().strip() for s in get_all_shift_keys()}
@@ -440,6 +484,7 @@ def export_filtered_excel(
     shift_values_up = [s.upper().strip() for s in (shift_values or [])]
     selected_shifts: Optional[Set[str]] = set(shift_values_up) if shift_values_up else None
 
+   
     def _apply_filters_no_period(q):
         # emp_id filter
         emp_ids = _normalize_to_list(emp_id)
@@ -456,7 +501,7 @@ def export_filtered_excel(
         # Clients & Departments
         q = apply_client_department_filters(q, clients=clients, departments=departments)
 
-        # Shift existence filter (only rows with at least one selected mapping)
+        
         if shift_values:
             q = q.filter(
                 exists().where(
@@ -497,7 +542,7 @@ def export_filtered_excel(
 
     messages: List[str] = []
 
-    # Resolve periods with fallbacks
+   
     if not years and not months:
         today = date.today()
         current_ym = f"{today.year:04d}-{today.month:02d}"
@@ -543,7 +588,7 @@ def export_filtered_excel(
             f"fell back to {meta['current_month_fallback_used']}."
         )
 
-    # Build and run the periods query
+
     def _build_periods_query():
         q = db.query(
             ShiftAllowances.id,
@@ -581,16 +626,16 @@ def export_filtered_excel(
         extra = (" " + " ".join(messages)) if messages else ""
         raise HTTPException(404, f"No data found for selected period/filters.{extra}")
 
-    # Rates (per shift type)
+  
     rates = {
         (r.shift_type or "").upper().strip(): float(r.amount or 0)
         for r in db.query(ShiftsAmount).all()
     }
 
-    # Aggregate employees with shift filter applied
+   
     unique_employees = _aggregate_unique_employees(db, all_rows, rates, selected_shifts)
 
-    # Headcount ranges
+    
     headcount_ranges = _parse_headcount_ranges(headcounts)
 
     # Grouping preference for headcount ranges
@@ -608,20 +653,29 @@ def export_filtered_excel(
         extra = (" " + " ".join(messages)) if messages else ""
         raise HTTPException(404, f"No employees match the requested headcount range(s).{extra}")
 
-    # Constrain rows to filtered employee IDs for overall shift summary
+   
+    allowance_ranges = _parse_allowance_ranges(allowance)
+    if allowance_ranges:
+        filtered_employees = [
+            e for e in filtered_employees
+            if _allowance_in_ranges(e.get("total_allowance", 0.0), allowance_ranges)
+        ]
+        if not filtered_employees:
+            extra = (" " + " ".join(messages)) if messages else ""
+            raise HTTPException(404, f"No employees match the requested allowance range(s).{extra}")
+
     filtered_emp_ids = {emp["emp_id"] for emp in filtered_employees}
     filtered_rows = [r for r in all_rows if r.emp_id in filtered_emp_ids]
 
-    # Overall shift totals/summary (honors selected shifts)
+    # Overall shift totals/summary (honors selected shifts AND allowance filter)
     overall_shift, overall_total = aggregate_shift_details(db, filtered_rows, rates, selected_shifts)
     headcount_value = len(filtered_employees)
 
-    # Sorting
+    
     sort_by_key = (sort_by or "total_allowance").strip().lower()
     sort_order_in = (sort_order or "default").strip().lower()
 
     valid_sort = {"client", "client_partner", "departments", "total_allowance", "headcount"}
-
     if sort_by_key not in valid_sort:
         raise HTTPException(400, f"sort_by must be one of {', '.join(sorted(valid_sort))}")
 
@@ -662,7 +716,7 @@ def export_filtered_excel(
     total_unique = len(filtered_employees)
     employees_page = filtered_employees[start:start + limit]
 
-    # Shift summary limited to > 0 for compactness
+   
     all_keys = [k.upper().strip() for k in get_all_shift_keys()]
     formatted_shift_summary = {
         k: round(float(overall_shift.get(k, 0.0)), 2)
@@ -670,11 +724,9 @@ def export_filtered_excel(
         if float(overall_shift.get(k, 0.0)) > 0.0
     }
 
-    # Shift meta (labels/timing/amount) for selected keys (or all if none selected)
     meta_keys = sorted(selected_shifts) if selected_shifts else all_keys
     shift_meta = _build_shift_meta(meta_keys, rates)
 
-    # Optional lookup 
     country_lookup = {
         "pst_mst": "PST/MST",
         "us_india": "US/India",
@@ -691,7 +743,7 @@ def export_filtered_excel(
         ],
         "data": {"employees": employees_page},
         "lookup": lookup,
-        "shift_meta": shift_meta,  
+        "shift_meta": shift_meta,
     }
 
     if messages:

@@ -271,7 +271,44 @@ def resolve_target_months(
         return [latest_dm[0].replace(day=1)]
 
     return []
+def parse_allowance_ranges(allowance) -> Optional[List[Tuple[float, float]]]:
+    """
+    Parses allowance ranges (inclusive) from payload["allowance"].
 
+    Accepts:
+      - None or "ALL" -> no filtering (returns None)
+      - "min-max" string, e.g., "1000-5000"
+      - list of such strings -> OR semantics across ranges
+    Returns:
+      - None, or List[(start: float, end: float)]
+    """
+    if allowance in (None, "ALL"):
+        return None
+
+    items = allowance if isinstance(allowance, list) else [allowance]
+    ranges: List[Tuple[float, float]] = []
+
+    for item in items:
+        s = str(item or "").strip()
+        if "-" not in s:
+            raise HTTPException(400, f"Invalid allowance range: {item}. Use 'min-max' like '1000-5000'.")
+
+        parts = s.split("-")
+        if len(parts) != 2:
+            raise HTTPException(400, f"Invalid allowance range: {item}. Use 'min-max' like '1000-5000'.")
+
+        try:
+            start = float(parts[0].strip())
+            end = float(parts[1].strip())
+        except Exception:
+            raise HTTPException(400, f"Invalid allowance numbers in range: {item}.")
+
+        if start > end:
+            raise HTTPException(400, f"Invalid allowance range (start > end): {item}.")
+
+        ranges.append((start, end))
+
+    return ranges or None
 def client_summary_service(db: Session, payload: dict):
 
     payload = payload or {}
@@ -311,6 +348,9 @@ def client_summary_service(db: Session, payload: dict):
 
     headcount_ranges = parse_headcount_ranges(payload.get("headcounts", "ALL"))
 
+
+    allowance_ranges = parse_allowance_ranges(payload.get("allowance"))
+
     months_to_use: List[date] = resolve_target_months(
         db=db,
         payload=payload,
@@ -338,6 +378,7 @@ def client_summary_service(db: Session, payload: dict):
             "client_partner": payload.get("client_partner"),
             "shifts": payload.get("shifts", "ALL"),
             "headcounts": payload.get("headcounts", "ALL"),
+            "allowance": payload.get("allowance", "ALL"),
             "sort_by": payload.get("sort_by", "client_total"),
             "sort_order": payload.get("sort_order", "desc"),
         }
@@ -346,7 +387,7 @@ def client_summary_service(db: Session, payload: dict):
 
         cached_resp = cache.get(response_cache_key)
         if cached_resp:
-           
+            # keep your existing cleanup
             if isinstance(cached_resp, dict) and "shift_details" in cached_resp:
                 cleaned = dict(cached_resp)
                 cleaned.pop("shift_details", None)
@@ -496,6 +537,12 @@ def client_summary_service(db: Session, payload: dict):
             return True
         return any(start <= hc <= end for start, end in ranges)
 
+    # NEW: helper for allowance match at client level
+    def allow_matches(total: float, ranges: Optional[List[Tuple[float, float]]]) -> bool:
+        if not ranges:
+            return True
+        return any(start <= float(total or 0.0) <= end for start, end in ranges)
+
     for month_str, month_data in aggregated.items():
 
         for client_name, client_data in month_data["clients"].items():
@@ -529,7 +576,12 @@ def client_summary_service(db: Session, payload: dict):
 
             client_headcount = len(unique_emp_ids)
 
+            # Apply headcount range filter (existing)
             if not range_matches(client_headcount, headcount_ranges):
+                continue
+
+            # NEW: Apply allowance filter at CLIENT level
+            if not allow_matches(client_total, allowance_ranges):
                 continue
 
             client_data["client_total"] = client_total

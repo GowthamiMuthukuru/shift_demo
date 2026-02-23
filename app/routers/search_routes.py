@@ -37,6 +37,10 @@ def fetch_employee_details(
             # Accepts "ALL", a single string "1-10", or list like ["1-10","11-20"].
             "headcounts": "ALL",
 
+            # NEW: Allowance filter (inclusive). Accepts "min-max" or ["a-b","c-d"] (OR semantics)
+             "allowance": "5000-20000",
+            # "allowance": ["0-5000", "10000-15000"],
+
             # Pagination
             "start": 0,
             "limit": 10,
@@ -51,7 +55,6 @@ def fetch_employee_details(
 ):
     """
     Fetch employee shift details using the provided request body filters.
-
     """
     # Backward-compat support for legacy keys if present
     clients_payload = payload.get("clients", payload.get("client", "ALL"))
@@ -71,4 +74,6 @@ def fetch_employee_details(
         headcounts=payload.get("headcounts", "ALL"),
         sort_by=payload.get("sort_by", "total_allowance"),
         sort_order=payload.get("sort_order", "default"),
+        
+        allowance=payload.get("allowance"),
     )

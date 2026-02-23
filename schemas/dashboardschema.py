@@ -84,7 +84,7 @@ class DashboardFilterRequest(BaseModel):
 
     sort_by: Optional[SortBy] = "total_allowance"
     sort_order: SortOrder = "default"
-
+    allowance: Optional[Union[str, List[str]]] = None
     @field_validator("clients", "departments", mode="before")
     def normalize_list_fields(cls, v):
         """
@@ -164,7 +164,7 @@ class ClientAnalyticsRequest(BaseModel):
     # (If 'headcount' is provided for employees, it falls back to 'total_allowance')
     sort_employees_by: Optional[str] = None
     sort_employees_order: Optional[str] = None
-
+    allowance: Optional[Union[str, List[str]]] = None
     class Config:
         extra = "forbid"
 
@@ -180,7 +180,7 @@ class ClientTotalAllowanceFilter(BaseModel):
     # Sorting options: add all supported keys
     sort_by: Literal["total_allowance", "client", "client_partner", "headcount", "departments"] = "total_allowance"
     sort_order: Literal["asc", "desc", "default"] = "default"
-
+    allowance: Optional[Union[str, List[str]]] = None
 
 class SelectedPeriod(BaseModel):
     year: int
@@ -212,7 +212,7 @@ class DashboardFilter(BaseModel):
     shifts: Union[str, List[str]] = "ALL"
     top: str = "ALL"
     client_starts_with: Optional[str] = None
-
+    allowance: Optional[Union[str, List[str]]] = None
    
     sort_by: Literal["total_allowance", "client", "client_partner", "headcount", "departments"] = "total_allowance"
     sort_order: Literal["asc", "desc", "default"] = "default"
@@ -238,7 +238,7 @@ class ClientSummaryRequest(BaseModel):
 
     sort_by: Optional[str] = None
     sort_order: Optional[str] = None
-
+    allowance: Optional[Union[str, List[str]]] = None
     model_config = ConfigDict(extra="forbid")
 
    
@@ -381,7 +381,7 @@ class DepartmentTotalAllowanceFilter(BaseModel):
     headcounts: Union[str, List[str]] = "ALL"
     shifts: Union[str, List[str]] = "ALL"
     top: str = "ALL"
-
+    allowance: Optional[Union[str, List[str]]] = None
     # Sorting options for department view
     sort_by: Literal["total_allowance", "department", "clients", "headcount"] = "total_allowance"
     sort_order: Literal["asc", "desc", "default"] = "default"

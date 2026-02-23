@@ -319,8 +319,12 @@ async def process_excel_upload(file, db: Session, user, base_url: str):
                     ))
 
             inserted += 1
-
-        db.commit()
+            uploaded_file.record_count = inserted
+            payroll_month_value = clean_df["payroll_month"].dropna().iloc[0] \
+                if not clean_df["payroll_month"].dropna().empty else None
+            uploaded_file.payroll_month = payroll_month_value
+            uploaded_file.status = "processed"
+            db.commit()
 
         if error_rows:
             raise HTTPException(400, make_json_safe({

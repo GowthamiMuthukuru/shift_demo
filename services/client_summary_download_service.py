@@ -18,6 +18,7 @@ CHANGES:
 
 from __future__ import annotations
 
+from decimal import Decimal, InvalidOperation
 import os
 import tempfile
 import json
@@ -400,6 +401,44 @@ def _apply_headcount_filter(df: pd.DataFrame, headcount_range: Optional[Tuple[in
     df2 = df2[mask].drop(columns=["_DeptHeadCount"])
     return df2
 
+def _parse_allowance_ranges(allowance):
+    """
+    Accepts: None | "ALL" -> None
+             "min-max"
+             ["a-b","c-d"] (OR semantics)
+    Returns: list of (float(min), float(max)) or None.
+    """
+    if allowance in (None, "ALL"):
+        return None
+
+    items = allowance if isinstance(allowance, list) else [allowance]
+    ranges = []
+    for item in items:
+        s = str(item or "").strip()
+        if "-" not in s:
+            raise HTTPException(400, f"Invalid allowance range: {item}. Use 'min-max' like '1000-5000'.")
+        parts = s.split("-")
+        if len(parts) != 2:
+            raise HTTPException(400, f"Invalid allowance range: {item}. Use 'min-max' like '1000-5000'.")
+        try:
+            lo = float(Decimal(parts[0].strip()))
+            hi = float(Decimal(parts[1].strip()))
+        except (InvalidOperation, ValueError):
+            raise HTTPException(400, f"Invalid allowance numbers in range: {item}.")
+        if lo > hi:
+            raise HTTPException(400, f"Invalid allowance range (start > end): {item}.")
+        ranges.append((lo, hi))
+    return ranges or None
+
+
+def _allowance_in_ranges(value: float, ranges) -> bool:
+    if not ranges:
+        return True
+    try:
+        v = float(value if value is not None else 0.0)
+    except Exception:
+        return False
+    return any(lo <= v <= hi for (lo, hi) in ranges)
 
 def client_summary_download_service(db: Session, payload: dict) -> str:
     """
@@ -411,13 +450,14 @@ def client_summary_download_service(db: Session, payload: dict) -> str:
     - If no data at all for requested selection, we write a Notes-only Excel instead of raising.
     - Headcount range filter (string "N" or "N-M") applied at DataFrame level.
     - EMPLOYEE-ONLY rows in Excel (department-only totals are skipped by design).
+    - NEW: Allowance filter at CLIENT level applied at DataFrame level (inclusive ranges).
     """
     payload = payload or {}
 
-    # Determine if this is the default request (for caching name/policy)
+   
     default_req = is_default_latest_month_request(payload)
 
-    # Normalize month/year ordering for cache predictability
+    
     if isinstance(payload.get("months"), list) and payload["months"]:
         payload["months"] = sorted({int(m) for m in payload["months"]})
     if isinstance(payload.get("years"), list) and payload["years"]:
@@ -425,11 +465,10 @@ def client_summary_download_service(db: Session, payload: dict) -> str:
 
     requested_periods = _requested_periods_from_payload(payload)
 
-    # Build cache anchors (latest month + shift signature) for default requests
     latest_ym = _get_db_latest_ym(db) if default_req else None
     shift_sig = _current_shift_signature() if default_req else None
 
-    cache_key = _stable_cache_key(payload, default_req, shift_sig)
+    cache_key = _stable_cache_key(payload, default_req, shift_sig) 
     final_default_path = os.path.join(EXPORT_DIR, DEFAULT_EXPORT_FILE)
     cached = cache.get(cache_key)
 
@@ -481,11 +520,11 @@ def client_summary_download_service(db: Session, payload: dict) -> str:
                 return written_path
         raise
 
-    # Optional filters (emp_id / client_partner) at export level
+   
     emp_ids_filter = _normalize_multi_str_or_list(payload.get("emp_id"))
     partner_filter = _normalize_multi_str_or_list(payload.get("client_partner"))
 
-    # Build DF (employees only)
+ 
     df, shift_cols = _build_dataframe_from_summary(
         summary_data,
         emp_ids_filter,
@@ -493,11 +532,34 @@ def client_summary_download_service(db: Session, payload: dict) -> str:
     )
     currency_cols = shift_cols + ["Total Allowance"]
 
-    # Apply headcount range filter (if provided)
     headcount_range = _parse_headcount_range_str(payload.get("headcounts"))
     df = _apply_headcount_filter(df, headcount_range)
 
-    # Notes about missing requested periods (if any)
+
+    allowance_ranges = _parse_allowance_ranges(payload.get("allowance"))
+    if allowance_ranges:
+
+        client_col = next((c for c in df.columns if str(c).strip().lower() == "client"), None)
+        if not client_col:
+          
+            raise HTTPException(status_code=400, detail="Cannot apply allowance filter: 'Client' column not found in export DataFrame.")
+
+       
+        if "Total Allowance" in df.columns:
+            df["Total Allowance"] = pd.to_numeric(df["Total Allowance"], errors="coerce").fillna(0.0)
+        else:
+            raise HTTPException(status_code=400, detail="Cannot apply allowance filter: 'Total Allowance' column not found in export DataFrame.")
+
+        client_totals = (
+            df.groupby(client_col, as_index=False)["Total Allowance"]
+              .sum()
+              .rename(columns={"Total Allowance": "_client_total"})
+        )
+
+        df = df.merge(client_totals, on=client_col, how="left")
+        mask = df["_client_total"].apply(lambda v: _allowance_in_ranges(v, allowance_ranges))
+        df = df[mask].drop(columns=["_client_total"])
+
     if requested_periods:
         present_periods = set(summary_data.keys())
         missing_periods = [p for p in requested_periods if p not in present_periods]
@@ -507,7 +569,6 @@ def client_summary_download_service(db: Session, payload: dict) -> str:
                 f"No data present for the following selected period(s): {pretty_missing}"
             )
 
-    # If no data to export, write notes-only Excel
     if df is None or df.empty:
         if not notes_lines:
             notes_lines.append("No data present.")
