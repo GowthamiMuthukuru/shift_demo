@@ -20,6 +20,7 @@ origins = [
     "http://127.0.0.1:5174",  
     "http://localhost:3000",
     "http://localhost:8000",  
+    "https://demo-repo-f9p9.vercel.app/"
 ]
 
 app.add_middleware(
